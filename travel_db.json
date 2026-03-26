@@ -1,50 +1,176 @@
-{  "flights": [
+{
+  "flights": [
     {
-      "origin": "London",
+      "origin": "TLV",
       "destination": "Paris",
-      "airline": "AirFrance",
-      "price": 120,
-      "flight_number": "AF123",
-      "availability": "Available"
+      "airline": "El Al",
+      "price": 350,
+      "flight_number": "LY321"
     },
     {
-      "origin": "New York",
+      "origin": "TLV",
       "destination": "London",
-      "airline": "Virgin Atlantic",
-      "price": 550,
-      "flight_number": "VS001",
-      "availability": "Limited"
+      "airline": "British Airways",
+      "price": 420,
+      "flight_number": "BA164"
     },
     {
       "origin": "London",
       "destination": "Tokyo",
       "airline": "JAL",
-      "price": 950,
-      "flight_number": "JL402",
-      "availability": "Available"
+      "price": 890,
+      "flight_number": "JL402"
     }
   ],
   "hotels": [
     {
       "city": "Paris",
-      "name": "Hotel Ritz",
-      "price_per_night": 450,
-      "stars": 5,
-      "amenities": ["Spa", "Fine Dining"]
+      "name": "Hotel de Ville",
+      "price_per_night": 140,
+      "stars": 3
     },
     {
       "city": "Paris",
-      "name": "EcoStay Paris",
-      "price_per_night": 85,
-      "stars": 2,
-      "amenities": ["Free WiFi"]
+      "name": "Luxury Palace",
+      "price_per_night": 550,
+      "stars": 5
     },
     {
       "city": "London",
       "name": "The Savoy",
       "price_per_night": 600,
-      "stars": 5,
-      "amenities": ["Butler Service", "River View"]
+      "stars": 5
+    },
+    {
+      "city": "Tokyo",
+      "name": "Shibuya Capsule",
+      "price_per_night": 45,
+      "stars": 2
     }
-  ]
+  ],
+  "activities": [
+    {
+      "city": "Paris",
+      "name": "Louvre Museum",
+      "category": "Culture",
+      "price": 20
+    },
+    {
+      "city": "Paris",
+      "name": "Eiffel Tower Tour",
+      "category": "Sightseeing",
+      "price": 35
+    },
+    {
+      "city": "London",
+      "name": "London Eye",
+      "category": "Sightseeing",
+      "price": 30
+    },
+    {
+      "city": "Tokyo",
+      "name": "Akihabara Gaming Tour",
+      "category": "Entertainment",
+      "price": 50
+    }
+  ],
+  "visa_requirements": [
+    {
+        "origin": "Israel",
+        "destination": "France",
+        "policy": "No visa required for tourism up to 90 days",
+        "days_allowed_without_visa": 90
+    },
+    {
+        "origin": "Israel",
+        "destination": "Japan",
+        "policy": "No visa required for tourism up to 90 days",
+        "days_allowed_without_visa": 90
+    },
+    {
+        "origin": "India",
+        "destination": "France",
+        "policy": "Schengen Visa required",
+        "days_allowed_without_visa": 0
+    }
+  ],
+  "exchange_rates": [
+  {
+    "origin_currency": "USD",
+    "destination_currency": "ILS",
+    "exchange_rate": 3.65
+  },
+  {
+    "origin_currency": "EUR",
+    "destination_currency": "USD",
+    "exchange_rate": 1.08
+  },
+  {
+    "origin_currency": "GBP",
+    "destination_currency": "USD",
+    "exchange_rate": 1.27
+  }
+],
+"car_rentals": [
+  {
+    "airport": "CDG",
+    "city": "Paris",
+    "company": "Hertz",
+    "price_per_day": 45,
+    "car_type": "Economy"
+  },
+  {
+    "airport": "CDG",
+    "city": "Paris",
+    "company": "Avis",
+    "price_per_day": 60,
+    "car_type": "SUV"
+  },
+  {
+    "airport": "LHR",
+    "city": "London",
+    "company": "Europcar",
+    "price_per_day": 55,
+    "car_type": "Compact"
+  }
+],
+"best_seasons": [
+  {
+    "city": "Paris",
+    "season": "Spring",
+    "months": ["March", "April", "May"]                                   
+  },
+  {
+    "city": "London",
+    "season": "Summer",
+    "months": ["June", "July", "August"]
+  },
+  {
+    "city": "Tokyo",
+    "season": "Autumn",
+    "months": ["September", "October", "November"]
+  }
+],
+"time_differences": [
+  {
+    "origin": "Tel Aviv",
+    "destination": "Paris",
+    "hours_difference": -1
+  },
+  {
+    "origin": "Tel Aviv",
+    "destination": "London",
+    "hours_difference": -2
+  },
+  {
+    "origin": "Tel Aviv",
+    "destination": "Tokyo",
+    "hours_difference": 7
+  },
+  {
+    "origin": "Paris",
+    "destination": "Tokyo",
+    "hours_difference": 8
+  }
+]
 }
