@@ -3,49 +3,49 @@
     {
       "origin": "TLV",
       "destination": "Paris",
-      "airline": "El Al",
-      "price": 350,
-      "flight_number": "LY321"
+      "airline": "AirFrance",
+      "price": 120,
+      "flight_number": "AF123",
+      "availability": "Available"
     },
     {
-      "origin": "TLV",
+      "origin": "New York",
       "destination": "London",
-      "airline": "British Airways",
-      "price": 420,
-      "flight_number": "BA164"
+      "airline": "Virgin Atlantic",
+      "price": 550,
+      "flight_number": "VS001",
+      "availability": "Limited"
     },
     {
       "origin": "London",
       "destination": "Tokyo",
       "airline": "JAL",
-      "price": 890,
-      "flight_number": "JL402"
+      "price": 950,
+      "flight_number": "JL402",
+      "availability": "Available"
     }
   ],
   "hotels": [
     {
       "city": "Paris",
-      "name": "Hotel de Ville",
-      "price_per_night": 140,
-      "stars": 3
+      "name": "Hotel Ritz",
+      "price_per_night": 450,
+      "stars": 5,
+      "amenities": ["Spa", "Fine Dining"]
     },
     {
       "city": "Paris",
-      "name": "Luxury Palace",
-      "price_per_night": 550,
-      "stars": 5
+      "name": "EcoStay Paris",
+      "price_per_night": 85,
+      "stars": 2,
+      "amenities": ["Free WiFi"]
     },
     {
       "city": "London",
       "name": "The Savoy",
       "price_per_night": 600,
-      "stars": 5
-    },
-    {
-      "city": "Tokyo",
-      "name": "Shibuya Capsule",
-      "price_per_night": 45,
-      "stars": 2
+      "stars": 5,
+      "amenities": ["Butler Service", "River View"]
     }
   ],
   "activities": [
