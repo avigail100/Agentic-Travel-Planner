@@ -266,6 +266,53 @@ def fetch_seasonal_recommendations(city: str):
     except Exception as e:
         return f"Error fetching seasonal recommendations: {e}"
 
+@tool
+def fetch_time_difference(origin: str, destination: str):
+    """
+    Fetch the time difference in hours between the origin city and the destination city.
+    Returns the time difference in hours.
+    """
+    try:
+        travel_db = load_json_db("travel_db.json")
+        time_differences = travel_db.get("time_differences", [])
+        matching_time_difference = [
+            time_diff for time_diff in time_differences
+            if time_diff["origin"].lower() == origin.lower() and time_diff["destination"].lower() == destination.lower()
+        ]
+
+        if not matching_time_difference:
+            return f"No time difference information found for {origin} to {destination}."
+
+        results = []
+
+        for time_diff in matching_time_difference:
+            filtered_time_diff = {
+                "hours_difference": time_diff["hours_difference"]
+            }
+            results.append(filtered_time_diff)
+        return results
+    except FileNotFoundError as e:
+        return f"Error finding file: {e}"
+    except json.JSONDecodeError as e:
+        return f"Error decoding JSON: {e}"
+    except Exception as e:
+        return f"Error fetching time difference: {e}"
+
+@tool
+def convert_time_to_destination_timezone(time_in_origin_timezone: str, time_difference_hours: int):
+    """
+    Convert a time from the origin timezone to the destination timezone using the provided time difference.
+    Returns the converted time in the destination timezone.
+    """
+    try:
+        from datetime import datetime, timedelta
+
+        origin_time = datetime.strptime(time_in_origin_timezone, "%Y-%m-%d %H:%M")
+        destination_time = origin_time + timedelta(hours=time_difference_hours)
+        return destination_time.strftime("%Y-%m-%d %H:%M")
+    except Exception as e:
+        return f"Error converting time: {e}"
+
 def load_json_db(file_path):
     with open(file_path, 'r') as f:
         return json.load(f)
@@ -311,6 +358,13 @@ def load_json_db(file_path):
     # seasonal_recommendations = fetch_seasonal_recommendations.invoke({'city': city})
     # print(f"Seasonal travel recommendations for {city}:")
     # print(seasonal_recommendations)
+    # city = "Paris"
+    # time_difference = fetch_time_difference.invoke({'origin': "Tel Aviv", 'destination': city})
+    # print(f"Time difference between Tel Aviv and {city}:")
+    # print(time_difference)
+    # time_in_origin_timezone = "2024-07-01 12:00"
+    # converted_time = convert_time_to_destination_timezone.invoke({'time_in_origin_timezone': time_in_origin_timezone, 'time_difference_hours': time_difference[0]['hours_difference']})
+    # print(f"Time in {city} when it's {time_in_origin_timezone} in Tel Aviv: {converted_time}")
 
     #סוכנויות רכב בשדה
     # עונה מומלצת
