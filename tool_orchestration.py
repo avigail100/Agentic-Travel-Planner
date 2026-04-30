@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, ToolMessage
-from tools import fetch_flights, fetch_hotels, calculate_trip_cost, fetch_activities, fetch_visa_requirements, fetch_curency_exchange_rate, convert_cost_to_origin_currency, fetch_car_rental_agencies, fetch_seasonal_recommendations
+from tools import fetch_flights, fetch_hotels, calculate_trip_cost, fetch_activities, fetch_visa_requirements, fetch_curency_exchange_rate, convert_cost_to_origin_currency, fetch_car_rental_agencies, fetch_seasonal_recommendations, fetch_time_difference, convert_time_to_destination_timezone
 
 load_dotenv()
 # 1. Initialize the Model (Gemini 2.5 Flash - 2026 Standard)
@@ -13,7 +13,7 @@ tools = [fetch_flights, fetch_hotels, calculate_trip_cost]
 llm_with_tools = llm.bind_tools(tools)
 try:
     # 3. Step A: Intent Detection
-    query = "I want to find a flight from London to tokyo" 
+    query = "I want to find a flight from New York to tokyo, if there is no directed flight please find me other cities that I can fly to as a connection" 
     ai_msg = llm_with_tools.invoke(query)
 
     # 4. Step B: Manual Execution (The Manual Loop)
@@ -30,7 +30,9 @@ try:
         "fetch_currency_exchange_rate": fetch_curency_exchange_rate,
         "convert_cost_to_origin_currency": convert_cost_to_origin_currency,
         "fetch_car_rental_agencies": fetch_car_rental_agencies,
-        "fetch_seasonal_recommendations": fetch_seasonal_recommendations
+        "fetch_seasonal_recommendations": fetch_seasonal_recommendations,
+        "fetch_time_difference": fetch_time_difference,
+        "convert_time_to_destination_timezone": convert_time_to_destination_timezone
         }
         
         # Iterate over each tool call identified by the model and execute them
