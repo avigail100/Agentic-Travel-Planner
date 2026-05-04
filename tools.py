@@ -1,125 +1,108 @@
 from langchain_core.tools import tool
-import json
+import sqlite3
+import os
+
+DB_PATH = "travel_agency.db"
+
+def _run_query(query: str, params: tuple = ()):
+    """Helper function to execute a SQL query and return results."""
+    if not os.path.exists(DB_PATH):
+        return "Error: Database file not found. Please run init_db.py first."
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query, params)
+        results = cursor.fetchall()
+        # Get column names to return a list of dictionaries
+        column_names = [description[0] for description in cursor.description]
+        return [dict(zip(column_names, row)) for row in results]
+    except sqlite3.Error as e:
+        return f"Database error: {e}"
+    finally:
+        conn.close()
 
 @tool
 def fetch_flights(origin: str, destination: str):
     """
-    Fetch available flights between two cities from the local database.
-    Returns a list of flights with prices, availability status and airline.
+    Search for available flights between two locations in the database.
+    Input:
+    - origin: 3-letter airport code (e.g., 'TLV', 'JFK', 'LHR').
+    - destination: Full city name (e.g., 'Paris', 'London', 'Tokyo').
+    Returns: List of matching flights with airline, price, and flight number.
     """
-    try:
-        travel_db = load_json_db("travel_db.json")
-        flights = travel_db.get("flights", [])
-        matching_flights = [
-            flight for flight in flights
-            if flight["origin"].lower() == origin.lower() and flight["destination"].lower() == destination.lower() 
-            and flight["availability"].lower() != "unavailable"
-        ]
-
-        if not matching_flights:
-            return f"No available flights found from {origin} to {destination}."
-
-        results = []
-
-        for flight in matching_flights:
-            filtered_flight = {
-                "airline": flight["airline"],
-                "flight_number": flight["flight_number"],
-                "price": flight["price"],
-                "availability": flight["availability"]
-            }
-            results.append(filtered_flight)
-        return results
-    except FileNotFoundError as e:
-        return f"Error finding file: {e}"
-    except json.JSONDecodeError as e:
-        return f"Error decoding JSON: {e}"
-    except Exception as e:  
-        return f"error fetching flights: {e}"
+    # Using LOWER() to ensure case-insensitive matching in the database
+    query = "SELECT airline, price, flight_number FROM flights WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
+    
+    # Pre-processing inputs to match the database format
+    origin_param = origin.strip().lower()
+    dest_param = destination.strip().lower()
+    
+    matches = _run_query(query, (origin_param, dest_param))
+    
+    if not matches or isinstance(matches, str):
+        return f"No flights found from {origin} to {destination}. Make sure to use airport codes for origin."
+    return matches
 
 @tool
-def fetch_hotels(city: str, budget: float = None):
+def fetch_hotels(city: str, max_price: int = None):
     """
-    Fetch available hotels in a specific city from the local database.
-    Optional budget parameter to filter hotels by price.
-    Returns a list of hotels with prices, star ratings, and amenities.
+    Find hotels in a specific city from the database.
+    Input: city name (string), max_price (optional integer).
     """
-    try:
-        travel_db = load_json_db("travel_db.json")
-        hotels = travel_db.get("hotels", [])
-        matching_hotels = [
-            hotel for hotel in hotels
-            if hotel["city"].lower() == city.lower() and (budget is None or hotel["price_per_night"] <= budget)
-        ]
-
-        if not matching_hotels:
-            return f"No available hotels found in {city}."
-
-        results = []
-
-        for hotel in matching_hotels:
-            filtered_hotel = {
-                "name": hotel["name"],
-                "price_per_night": hotel["price_per_night"],
-                "stars": hotel["stars"],
-                "amenities": hotel["amenities"]
-            }
-            results.append(filtered_hotel)
-        return results
-    except FileNotFoundError as e:
-        return f"Error finding file: {e}"
-    except json.JSONDecodeError as e:
-        return f"Error decoding JSON: {e}"
-    except Exception as e:
-        return f"Error fetching hotels: {e}"
+    query = "SELECT name, price_per_night, stars FROM hotels WHERE LOWER(city) = ?"
+    params = [city.strip().lower()]
+    
+    if max_price is not None:
+        query += " AND price_per_night <= ?"
+        params.append(max_price)
+    
+    matches = _run_query(query, tuple(params))
+    
+    if not matches or isinstance(matches, str):
+        return f"No hotels found in {city} meeting those criteria."
+    return matches
 
 @tool
-def calculate_trip_cost(flight_price: float, hotel_price_per_night: float, nights: int):
+def calculate_trip_cost(flight_price: float, hotel_price_per_night: float, duration_days: int):
     """
-    Calculate the total cost of a trip based on flight price, hotel price per night, and number of nights.
-    Returns the total estimated cost of the trip with service charges.
+    Calculates the total cost for a trip including flight and hotel stay.
+    Input: flight_price (float), hotel_price_per_night (float), duration_days (int).
     """
     try:
-        total_cost = flight_price + (hotel_price_per_night * nights)
-        return total_cost*1.1
-    except Exception as e:
-        return f"Error calculating trip cost: {e}"
+        total_hotel = float(hotel_price_per_night) * int(duration_days)
+        total_grand = float(flight_price) + total_hotel
+        
+        return {
+            "breakdown": {
+                "flight": flight_price,
+                "hotel_total": total_hotel,
+                "days": duration_days
+            },
+            "total_estimate": total_grand,
+            "currency": "USD"
+        }
+    except (ValueError, TypeError):
+        return "Error: Please provide valid numbers for prices and duration."
 
 @tool
-def fetch_activities(city: str, budget: float = None):
+def fetch_activities(city: str, max_price: int = None):
     """
-    Fetch available activities in a specific city from the local database.
-    Optional budget parameter to filter activities by price.
-    Returns a list of activities with prices, ratings, and descriptions.
+    Find activities in a specific city from the database.
+    Input: city name (string), max_price (optional integer).
     """
-    try:
-        travel_db = load_json_db("travel_db.json")
-        activities = travel_db.get("activities", [])
-        matching_activities = [
-            activity for activity in activities
-            if activity["city"].lower() == city.lower() and (budget is None or activity["price"] <= budget)
-            
-        ]
-
-        if not matching_activities:
-            return f"No available activities found in {city}."
-
-        results = []
-
-        for activity in matching_activities:
-            filtered_activity = {
-                "name": activity["name"],
-                "price": activity["price"],
-                "category": activity["category"]
-            }
-            results.append(filtered_activity)
-        return results
-    except FileNotFoundError as e:
-        return f"Error finding file: {e}"
-    except json.JSONDecodeError as e:
-        return f"Error decoding JSON: {e}"
-    except Exception as e:
-        return f"Error fetching activities: {e}"
+    query = "SELECT name, price, category FROM activities WHERE LOWER(city) = ?"
+    params = [city.strip().lower()]
+    
+    if max_price is not None:
+        query += " AND price <= ?"
+        params.append(max_price)
+    
+    matches = _run_query(query, tuple(params))
+    
+    if not matches or isinstance(matches, str):
+        return f"No activities found in {city} meeting those criteria."
+    return matches
 
 @tool
 def fetch_visa_requirements(origin: str, destination: str):
@@ -127,32 +110,15 @@ def fetch_visa_requirements(origin: str, destination: str):
     Fetch visa requirements for travelers from the origin country to the destination country.
     Returns visa requirement policy and the amount of days you can stay without a visa.
     """
-    try:
-        travel_db = load_json_db("travel_db.json")
-        visas = travel_db.get("visa_requirements", [])
-        matching_visa = [
-            visa for visa in visas
-             if visa["origin"].lower() == origin.lower() and visa["destination"].lower() == destination.lower()
-        ]
-
-        if not matching_visa:
-            return f"No visa requirement information found for travelers from {origin} to {destination}."
-
-        results = []
-
-        for visa in matching_visa:
-            filtered_visa = {
-                "days_allowed_without_visa": visa["days_allowed_without_visa"],
-                "policy": visa["policy"]
-            }
-            results.append(filtered_visa)
-        return results
-    except FileNotFoundError as e:
-        return f"Error finding file: {e}"
-    except json.JSONDecodeError as e:
-        return f"Error decoding JSON: {e}"
-    except Exception as e:
-        return f"Error fetching visa requirements: {e}"
+    query = "SELECT days_allowed_without_visa, policy FROM visa_requirements WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
+    origin_param = origin.strip().lower()
+    dest_param = destination.strip().lower()
+    
+    matches = _run_query(query, (origin_param, dest_param))
+    
+    if not matches or isinstance(matches, str):
+        return f"No visa requirement information found for travelers from {origin} to {destination}."
+    return matches
 
 @tool
 def fetch_curency_exchange_rate(origin_currency: str, destination_currency: str):
@@ -160,31 +126,15 @@ def fetch_curency_exchange_rate(origin_currency: str, destination_currency: str)
     Fetch the current exchange rate between the origin currency and the destination currency.
     Returns the exchange rate as of today.
     """
-    try:
-        travel_db = load_json_db("travel_db.json")
-        exchange_rates = travel_db.get("exchange_rates", [])
-        matching_rate = [
-            rate for rate in exchange_rates
-            if rate["origin_currency"].lower() == origin_currency.lower() and rate["destination_currency"].lower() == destination_currency.lower()
-        ]
-
-        if not matching_rate:
-            return f"No exchange rate information found for {origin_currency} to {destination_currency}."
-
-        results = []
-
-        for rate in matching_rate:
-            filtered_rate = {
-                "exchange_rate": rate["exchange_rate"]
-            }
-            results.append(filtered_rate)
-        return results
-    except FileNotFoundError as e:
-        return f"Error finding file: {e}"
-    except json.JSONDecodeError as e:
-        return f"Error decoding JSON: {e}"
-    except Exception as e:
-        return f"Error fetching currency exchange rates: {e}"
+    query = "SELECT exchange_rate FROM exchange_rates WHERE LOWER(origin_currency) = ? AND LOWER(destination_currency) = ?"
+    origin_param = origin_currency.strip().lower()
+    dest_param = destination_currency.strip().lower()
+    
+    matches = _run_query(query, (origin_param, dest_param))
+    
+    if not matches or isinstance(matches, str):
+        return f"No exchange rate information found for {origin_currency} to {destination_currency}."
+    return matches
 
 @tool
 def convert_cost_to_origin_currency(cost_in_destination_currency: float, exchange_rate: float):
@@ -201,70 +151,32 @@ def convert_cost_to_origin_currency(cost_in_destination_currency: float, exchang
 @tool
 def fetch_car_rental_agencies(city: str):
     """
-    Fetch available car rental agencies in a specific city from the local database.
+    Fetch available car rental agencies in a specific city from the database.
     Returns a list of car rental agencies with price per day and car types.
     """
-    try:
-        travel_db = load_json_db("travel_db.json")
-        car_rentals = travel_db.get("car_rentals", [])
-        matching_agencies = [
-            agency for agency in car_rentals
-            if agency["city"].lower() == city.lower()
-        ]
-
-        if not matching_agencies:
-            return f"No available car rental agencies found in {city}."
-
-        results = []
-
-        for agency in matching_agencies:
-            filtered_agency = {
-                "company": agency["company"],
-                "airport": agency["airport"],
-                "price_per_day": agency["price_per_day"],
-                "car_type": agency["car_type"]
-            }
-            results.append(filtered_agency)
-        return results
-    except FileNotFoundError as e:
-        return f"Error finding file: {e}"
-    except json.JSONDecodeError as e:
-        return f"Error decoding JSON: {e}"
-    except Exception as e:
-        return f"Error fetching car rental agencies: {e}"
+    query = "SELECT company, airport, price_per_day, car_type FROM car_rentals WHERE LOWER(city) = ?"
+    city_param = city.strip().lower()
+    
+    matches = _run_query(query, (city_param,))
+    
+    if not matches or isinstance(matches, str):
+        return f"No available car rental agencies found in {city}."
+    return matches
 
 @tool
 def fetch_seasonal_recommendations(city: str):
     """
-    Fetch seasonal travel recommendations for a specific city from the local database.
+    Fetch seasonal travel recommendations for a specific city from the database.
     Returns the best season to visit and the months when it's ideal.
     """
-    try:
-        travel_db = load_json_db("travel_db.json")
-        seasonal_recommendations = travel_db.get("best_seasons", [])
-        matching_recommendation = [
-            recommendation for recommendation in seasonal_recommendations
-            if recommendation["city"].lower() == city.lower()
-        ]
-
-        if not matching_recommendation:
-            return f"No seasonal recommendations found for {city}."
-
-        results = []
-
-        for recommendation in matching_recommendation:
-            filtered_recommendation = {
-                "best_season": recommendation["season"],
-                "ideal_months": recommendation["months"]
-            }
-            results.append(filtered_recommendation)
-        return results
-    except FileNotFoundError as e:
-        return f"Error finding file: {e}"
-    except json.JSONDecodeError as e:
-        return f"Error decoding JSON: {e}"
-    except Exception as e:
-        return f"Error fetching seasonal recommendations: {e}"
+    query = "SELECT season as best_season, months as ideal_months FROM best_seasons WHERE LOWER(city) = ?"
+    city_param = city.strip().lower()
+    
+    matches = _run_query(query, (city_param,))
+    
+    if not matches or isinstance(matches, str):
+        return f"No seasonal recommendations found for {city}."
+    return matches
 
 @tool
 def fetch_time_difference(origin: str, destination: str):
@@ -272,31 +184,15 @@ def fetch_time_difference(origin: str, destination: str):
     Fetch the time difference in hours between the origin city and the destination city.
     Returns the time difference in hours.
     """
-    try:
-        travel_db = load_json_db("travel_db.json")
-        time_differences = travel_db.get("time_differences", [])
-        matching_time_difference = [
-            time_diff for time_diff in time_differences
-            if time_diff["origin"].lower() == origin.lower() and time_diff["destination"].lower() == destination.lower()
-        ]
-
-        if not matching_time_difference:
-            return f"No time difference information found for {origin} to {destination}."
-
-        results = []
-
-        for time_diff in matching_time_difference:
-            filtered_time_diff = {
-                "hours_difference": time_diff["hours_difference"]
-            }
-            results.append(filtered_time_diff)
-        return results
-    except FileNotFoundError as e:
-        return f"Error finding file: {e}"
-    except json.JSONDecodeError as e:
-        return f"Error decoding JSON: {e}"
-    except Exception as e:
-        return f"Error fetching time difference: {e}"
+    query = "SELECT hours_difference FROM time_differences WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
+    origin_param = origin.strip().lower()
+    dest_param = destination.strip().lower()
+    
+    matches = _run_query(query, (origin_param, dest_param))
+    
+    if not matches or isinstance(matches, str):
+        return f"No time difference information found for {origin} to {destination}."
+    return matches
 
 @tool
 def convert_time_to_destination_timezone(time_in_origin_timezone: str, time_difference_hours: int):
@@ -313,9 +209,7 @@ def convert_time_to_destination_timezone(time_in_origin_timezone: str, time_diff
     except Exception as e:
         return f"Error converting time: {e}"
 
-def load_json_db(file_path):
-    with open(file_path, 'r') as f:
-        return json.load(f)
+
     
 # if __name__ == "__main__":
     # origin = "London"
