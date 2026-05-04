@@ -3,8 +3,6 @@
 LLM-powered Agent: Takes ONE user prompt, LLM decides which tools to call
 """
 
-import sys
-sys.path.insert(0, '/Users/omerburshan/Documents/Agentic-Travel-Planner')
 
 import os
 from dotenv import load_dotenv
