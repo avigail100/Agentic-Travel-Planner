@@ -96,7 +96,7 @@ def create_travel_db():
 
     # 3. Insert Data
 
-    # --- Hotels (Merged with JSON amenities) ---
+    # --- Hotels ---
     hotels = [
         ('Paris', 'Hotel Ritz', 450, 5, 'Spa, Fine Dining'),
         ('Paris', 'EcoStay Paris', 85, 2, 'Free WiFi'),
@@ -107,7 +107,7 @@ def create_travel_db():
     ]
     cursor.executemany("INSERT INTO hotels (city, name, price_per_night, stars, amenities) VALUES (?, ?, ?, ?, ?)", hotels)
 
-    # --- Flights (Merged with JSON availability) ---
+    # --- Flights ---
     flights = [
         ('TLV', 'Paris', 'AirFrance', 120, 'AF123', 'Available'),
         ('New York', 'London', 'Virgin Atlantic', 550, 'VS001', 'Limited'),
