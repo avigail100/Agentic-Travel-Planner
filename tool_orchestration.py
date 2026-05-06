@@ -6,7 +6,7 @@ from tools import fetch_flights, fetch_hotels, calculate_trip_cost, fetch_activi
 
 load_dotenv()
 # 1. Initialize the Model (Gemini 2.5 Flash - 2026 Standard)
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, max_retries=0)
 
 # 2. Tool Binding
 tools = [fetch_flights, fetch_hotels, calculate_trip_cost]
@@ -58,6 +58,8 @@ try:
         *tool_responses # Unpacking the list of tool responses into a single list of messages
         ])
         print(f"\nFinal Agent Response: {final_response.content}")
+    else:
+        print(f"\nNo tool calls made. Agent Response: {ai_msg.content}")
 
 except Exception as e:
     print(f"An error occurred: {e}")
