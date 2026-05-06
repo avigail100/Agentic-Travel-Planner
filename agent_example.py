@@ -25,9 +25,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from tools import (
     fetch_flights, fetch_hotels, fetch_activities,
     fetch_visa_requirements, fetch_time_difference,
-    calculate_trip_cost, fetch_curency_exchange_rate,
+    calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
-    fetch_seasonal_recommendations, convert_time_to_destination_timezone
+    fetch_seasonal_recommendations, convert_time_to_destination_timezone, lookup_location_options
 )
 
 load_dotenv()
@@ -73,9 +73,11 @@ class AgentState(TypedDict):
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
     fetch_visa_requirements, fetch_time_difference,
-    calculate_trip_cost, fetch_curency_exchange_rate,
+    calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
-    fetch_seasonal_recommendations, convert_time_to_destination_timezone
+    fetch_seasonal_recommendations, convert_time_to_destination_timezone,
+    lookup_location_options
+    
 ]
 
 model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, max_retries=0).bind_tools(tools)
