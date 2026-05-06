@@ -19,9 +19,9 @@ from langgraph.prebuilt import ToolNode
 from tools import (
     fetch_flights, fetch_hotels, fetch_activities,
     fetch_visa_requirements, fetch_time_difference,
-    calculate_trip_cost, fetch_curency_exchange_rate,
+    calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
-    fetch_seasonal_recommendations, convert_time_to_destination_timezone
+    fetch_seasonal_recommendations, convert_time_to_destination_timezone, lookup_location_options
 )
 
 load_dotenv()
@@ -49,9 +49,11 @@ class AgentState(TypedDict):
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
     fetch_visa_requirements, fetch_time_difference,
-    calculate_trip_cost, fetch_curency_exchange_rate,
+    calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
-    fetch_seasonal_recommendations, convert_time_to_destination_timezone
+    fetch_seasonal_recommendations, convert_time_to_destination_timezone,
+    lookup_location_options
+    
 ]
 
 # Note: max_retries=0 is kept so it fails fast on quota limits instead of hanging indefinitely
