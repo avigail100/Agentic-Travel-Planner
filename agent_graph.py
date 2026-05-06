@@ -32,7 +32,7 @@ from tools import (
 
 load_dotenv()
 
-MAX_STEPS = 6
+MAX_STEPS = 10
 
 SYSTEM_PROMPT = """You are a proactive travel planning assistant. Use the available tools to fetch real data and answer the user directly.
 
@@ -44,6 +44,11 @@ Rules:
 - Once you have tool results, give a direct answer. Do not ask follow-up questions if you
   already have enough data to respond.
 - If a city or route is not found in the database, say so clearly instead of retrying.
+- If a complex request (e.g., flight, hotel, car rental, and activities) is only partially fulfillable due to missing data,
+  do not return an error. Proceed by organizing the trip with the available information. 
+- Flights are the only mandatory component. All other items (hotels, cars, activities) are optional; 
+  if they are unavailable in the database, simply inform the user that those specific components could not be found 
+  and provide the rest of the itinerary as planned.
 """
 
 BANNER = r"""
@@ -80,7 +85,7 @@ tools = [
     
 ]
 
-model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, max_retries=0).bind_tools(tools)
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, max_retries=2).bind_tools(tools)
 
 # ============================================================================
 # 3. Define Nodes
@@ -103,7 +108,6 @@ def intent_classifier_node(state: AgentState):
             return {"intent": intent}
     return {"intent": "general"}
 
-
 def context_extractor_node(state: AgentState):
     """
     Extracts destination city and budget from the user's message using regex.
@@ -125,10 +129,13 @@ def context_extractor_node(state: AgentState):
     if budget_match:
         updates["total_budget"] = float(budget_match.group(1).replace(",", ""))
 
+    # Extract Nights (Default to 1 if not found)
+    nights_match = re.search(r'(\d+)\s+night', text, re.IGNORECASE)
+    updates["nights"] = int(nights_match.group(1)) if nights_match else 1
+    
     # Only return fields that were actually found — preserves previous turn's
     # values on follow-up queries like "also book me a car"
     return updates
-
 
 def call_model(state: AgentState):
     """
@@ -147,7 +154,6 @@ def call_model(state: AgentState):
 
     return {"messages": [response], "step_count": state.get("step_count", 0) + 1}
 
-
 def step_limit_node(_state: AgentState):
     """
     Injects the step-limit warning message. Separated from the router so the
@@ -158,7 +164,6 @@ def step_limit_node(_state: AgentState):
                 f"steps ({MAX_STEPS}). Generating a partial summary based on collected data."
     )
     return {"messages": [warning]}
-
 
 def _current_turn_tool_messages(state: AgentState):
     """Return only ToolMessages from the current user turn.
@@ -172,7 +177,6 @@ def _current_turn_tool_messages(state: AgentState):
             cut = i
             break
     return [m for m in messages[cut:] if m.__class__.__name__ == "ToolMessage"]
-
 
 def validator_node(state: AgentState):
     """
@@ -188,7 +192,6 @@ def validator_node(state: AgentState):
         if "fetch_hotels" not in tool_names_called:
             missing.append("hotel data")
     return {"missing_data": missing}
-
 
 def retry_injector_node(state: AgentState):
     """
@@ -216,7 +219,6 @@ def cost_calculator_node(state: AgentState):
             continue
     return {"calculated_total": total}
 
-
 def budget_check_node(state: AgentState):
     """
     Compares the calculated total against the user's budget.
@@ -225,6 +227,23 @@ def budget_check_node(state: AgentState):
     total = state.get("calculated_total", 0)
     return {"over_budget": budget > 0 and total > budget}
 
+def tool_error_node(state: AgentState):
+    """
+    Surfaces tool errors directly to the user instead of looping back to the agent.
+    Triggered when a tool returns a 'not found' or error string rather than data.
+    """
+    errors = []
+    for msg in reversed(state["messages"]):
+        if msg.__class__.__name__ == "AIMessage":
+            break  # only look at the most recent tool round
+        if msg.__class__.__name__ == "ToolMessage":
+            content = msg.content
+            if isinstance(content, str) and not content.startswith("["):
+                errors.append(content)
+
+    error_summary = "\n".join(f"- {e}" for e in errors)
+    message = f"I wasn't able to find the requested data:\n{error_summary}\n\n."
+    return {"messages": [AIMessage(content=message)]}  
 
 def formatter_node(state: AgentState):
     """
@@ -270,7 +289,7 @@ def formatter_node(state: AgentState):
 
 
 # ============================================================================
-# 4. Define Routing Functions (pure — no state mutations)
+# 4. Define Routing Functions
 # ============================================================================
 def should_continue(state: AgentState):
     if state.get("step_count", 0) >= MAX_STEPS:
@@ -279,41 +298,33 @@ def should_continue(state: AgentState):
         return "tools"
     return "validator"
 
-
-def tool_error_node(state: AgentState):
-    """
-    Surfaces tool errors directly to the user instead of looping back to the agent.
-    Triggered when a tool returns a 'not found' or error string rather than data.
-    """
-    errors = []
-    for msg in reversed(state["messages"]):
-        if msg.__class__.__name__ == "AIMessage":
-            break  # only look at the most recent tool round
-        if msg.__class__.__name__ == "ToolMessage":
-            content = msg.content
-            if isinstance(content, str) and not content.startswith("["):
-                errors.append(content)
-
-    error_summary = "\n".join(f"- {e}" for e in errors)
-    message = f"I wasn't able to find the requested data:\n{error_summary}\n\nPlease check the destination name and try again."
-    return {"messages": [AIMessage(content=message)]}
-
-
 def check_tool_errors(state: AgentState):
     """
-    After tools run: if any tool returned an error string (not JSON data),
+    After tools run: if any requiered tool returned an error string (not JSON data),
     route to the error handler instead of back to the agent.
     """
+    required_tools = ["fetch_flights", "fetch_hotels"]
+    
     for msg in reversed(state["messages"]):
         if msg.__class__.__name__ == "AIMessage":
-            break  # only check the current tool round
+            break  
         if msg.__class__.__name__ == "ToolMessage":
             content = msg.content
             # Tool errors are plain strings; successful results are JSON
-            if isinstance(content, str) and not content.startswith("[") and not content.startswith("{"):
-                return "tool_error"
+            if msg.name in required_tools:
+                if isinstance(content, str) and not (content.startswith("[") or content.startswith("{")):
+                    return "tool_error"
+            
+    # # For optional tools, we go back to the agent to let it handle the missing data
+    # for msg in reversed(state["messages"]):
+    #     if msg.__class__.__name__ == "AIMessage":
+    #         break  # only check the current tool round
+    #     if msg.__class__.__name__ == "ToolMessage":
+    #         content = msg.content
+    #         # Tool errors are plain strings; successful results are JSON
+    #         if isinstance(content, str) and not content.startswith("[") and not content.startswith("{"):
+    #             return "tool_error"
     return "agent"
-
 
 def should_retry(state: AgentState):
     missing = state.get("missing_data", [])
