@@ -212,14 +212,17 @@ def step_limit_node(_state: AgentState):
 
 
 def validator_node(state: AgentState):
-    tool_names_called = {m.name for m in _current_turn_tool_messages(state)}
+    tool_names_called = {
+        m.name for m in state["messages"] 
+        if m.__class__.__name__ == "ToolMessage"
+    }
     intent = state.get("intent", "general")
     missing = []
     if intent == "full_trip":
         if "fetch_flights" not in tool_names_called:
             missing.append("flight data")
-        if "fetch_hotels" not in tool_names_called:
-            missing.append("hotel data")
+        # if "fetch_hotels" not in tool_names_called:
+        #     missing.append("hotel data")
     return {"missing_data": missing}
 
 
@@ -316,15 +319,23 @@ def formatter_node(state: AgentState):
 # ============================================================================
 
 def should_continue(state: AgentState):
+    last_msg = state["messages"][-1]
+    # 1. Step limit reached
     if state.get("step_count", 0) >= MAX_STEPS:
         return "step_limit"
-    if getattr(state["messages"][-1], "tool_calls", None):
+    # 2. API error detected in the last message -> formater for error display
+    if isinstance(last_msg.content, str) and "[ERROR]" in last_msg.content:
+        return "formatter"
+    # 3. If the last message includes tool calls -> tools 
+    if getattr(last_msg, "tool_calls", None):
         return "tools"
+    # Otherwise, go to validator
     return "validator"
 
 
 def check_tool_errors(state: AgentState):
-    required_tools = {"fetch_flights", "fetch_hotels"}
+    # required_tools = {"fetch_flights", "fetch_hotels"}
+    required_tools = {}
     for msg in reversed(state["messages"]):
         if msg.__class__.__name__ == "AIMessage":
             break
@@ -381,7 +392,8 @@ builder.add_conditional_edges(
 builder.add_edge("personalization", "agent")
 builder.add_conditional_edges(
     "agent", should_continue,
-    {"tools": "tools", "validator": "validator", "step_limit": "step_limit"},
+    {"tools": "tools", "validator": "validator",
+     "step_limit": "step_limit", "formatter": "formatter"},
 )
 builder.add_edge("tools", "preference_persist")
 builder.add_conditional_edges(
@@ -499,6 +511,20 @@ def run_agent():
             print("Searching...\n")
 
             for event in graph.stream(initial_state, config, stream_mode="values"):
+                # --- DEBUG ---
+                print("\n" + "="*40)
+                print("--- FULL STATE SNAPSHOT ---")
+                
+                state_data = {k: v for k, v in event.items() if k != "messages"}
+                print(f"Current Metadata: {state_data}")
+                
+                print(f"Total messages in memory: {len(event['messages'])}")
+                
+                last_msg = event["messages"][-1]
+                print(f"Last Actor: {last_msg.__class__.__name__}")
+                print(f"Last Message Content: {last_msg.content}")
+                print("="*40)
+                # --- DEBUG ---
                 last = event["messages"][-1]
                 content = last.content
                 if isinstance(content, list):
