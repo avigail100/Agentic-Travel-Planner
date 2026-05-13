@@ -126,6 +126,64 @@ def _current_turn_tool_messages(state: AgentState):
             break
     return [m for m in messages[cut:] if m.__class__.__name__ == "ToolMessage"]
 
+def _extract_no_matches(state: AgentState) -> list[dict]:
+    """
+    Scans current-turn ToolMessages for two kinds of "no result" signals:
+
+    1. lookup_location_options returned a no_direct_match dict AND the LLM
+       decided Case B (genuine mismatch) — detectable because the LLM then
+       writes the string "NO_MATCH:<term>" as its *next* AIMessage content
+       before calling another tool, OR because the tool result itself is a
+       no_direct_match dict with no subsequent successful fetch.
+
+    2. A fetch tool (fetch_flights, fetch_hotels, fetch_activities) returned
+       a plain "No X found" error string — meaning the location existed in
+       the lookup table but has no actual inventory for this route/city.
+
+    Returns a list of dicts: [{search_term, source, available_locations}, ...]
+    """
+    no_matches = []
+    tool_msgs = _current_turn_tool_messages(state)
+
+    # --- Case B signal: LLM wrote "NO_MATCH:<term>" after lookup returned no_direct_match ---
+    for msg in tool_msgs:
+        if getattr(msg, "name", None) != "lookup_location_options":
+            continue
+        content = msg.content
+        if isinstance(content, str) and content.startswith("NO_MATCH:"):
+            search_term = content[len("NO_MATCH:"):].strip()
+            no_matches.append({"search_term": search_term, "source": "lookup", "available_locations": []})
+        else:
+            try:
+                data = json.loads(content) if isinstance(content, str) else content
+                if isinstance(data, dict) and data.get("no_direct_match"):
+                    # Tool returned no_direct_match; include its available list
+                    # so alternatives_injector can reason over it even if the
+                    # LLM didn't explicitly write NO_MATCH:<term>
+                    no_matches.append({
+                        "search_term": data.get("search_term", "requested location"),
+                        "source": "lookup",
+                        "available_locations": data.get("available_locations", []),
+                    })
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # --- Fetch failure: tool returned a "No X found" plain-text error ---
+    FETCH_TOOLS = {"fetch_flights", "fetch_hotels", "fetch_activities"}
+    NO_RESULT_PHRASES = ("no flights found", "no hotels found", "no activities found")
+    for msg in tool_msgs:
+        if getattr(msg, "name", None) not in FETCH_TOOLS:
+            continue
+        content = msg.content if isinstance(msg.content, str) else ""
+        if any(phrase in content.lower() for phrase in NO_RESULT_PHRASES):
+            no_matches.append({
+                "search_term": content,   # e.g. "No flights found from TLV to London."
+                "source": "fetch",
+                "available_locations": [],
+            })
+
+    return no_matches
+
 # ============================================================================
 # 4. Nodes
 # ============================================================================
@@ -257,65 +315,6 @@ def call_model(state: AgentState):
             "step_count": state.get("step_count", 0) + 1,
         }
     return {"messages": [response], "step_count": state.get("step_count", 0) + 1}
-
-
-def _extract_no_matches(state: AgentState) -> list[dict]:
-    """
-    Scans current-turn ToolMessages for two kinds of "no result" signals:
-
-    1. lookup_location_options returned a no_direct_match dict AND the LLM
-       decided Case B (genuine mismatch) — detectable because the LLM then
-       writes the string "NO_MATCH:<term>" as its *next* AIMessage content
-       before calling another tool, OR because the tool result itself is a
-       no_direct_match dict with no subsequent successful fetch.
-
-    2. A fetch tool (fetch_flights, fetch_hotels, fetch_activities) returned
-       a plain "No X found" error string — meaning the location existed in
-       the lookup table but has no actual inventory for this route/city.
-
-    Returns a list of dicts: [{search_term, source, available_locations}, ...]
-    """
-    no_matches = []
-    tool_msgs = _current_turn_tool_messages(state)
-
-    # --- Case B signal: LLM wrote "NO_MATCH:<term>" after lookup returned no_direct_match ---
-    for msg in tool_msgs:
-        if getattr(msg, "name", None) != "lookup_location_options":
-            continue
-        content = msg.content
-        if isinstance(content, str) and content.startswith("NO_MATCH:"):
-            search_term = content[len("NO_MATCH:"):].strip()
-            no_matches.append({"search_term": search_term, "source": "lookup", "available_locations": []})
-        else:
-            try:
-                data = json.loads(content) if isinstance(content, str) else content
-                if isinstance(data, dict) and data.get("no_direct_match"):
-                    # Tool returned no_direct_match; include its available list
-                    # so alternatives_injector can reason over it even if the
-                    # LLM didn't explicitly write NO_MATCH:<term>
-                    no_matches.append({
-                        "search_term": data.get("search_term", "requested location"),
-                        "source": "lookup",
-                        "available_locations": data.get("available_locations", []),
-                    })
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    # --- Fetch failure: tool returned a "No X found" plain-text error ---
-    FETCH_TOOLS = {"fetch_flights", "fetch_hotels", "fetch_activities"}
-    NO_RESULT_PHRASES = ("no flights found", "no hotels found", "no activities found")
-    for msg in tool_msgs:
-        if getattr(msg, "name", None) not in FETCH_TOOLS:
-            continue
-        content = msg.content if isinstance(msg.content, str) else ""
-        if any(phrase in content.lower() for phrase in NO_RESULT_PHRASES):
-            no_matches.append({
-                "search_term": content,   # e.g. "No flights found from TLV to London."
-                "source": "fetch",
-                "available_locations": [],
-            })
-
-    return no_matches
 
 
 def step_limit_node(_state: AgentState):
@@ -460,7 +459,7 @@ def check_tool_errors(state: AgentState):
     - 'agent'        otherwise (normal continuation)
     """
     if _extract_no_matches(state):
-        print(f"\n[Router] NO_MATCH signal detected → alternatives_injector")
+        # print(f"\n[Router] NO_MATCH signal detected → alternatives_injector")
         return "alternatives"
 
     # required_tools = {"fetch_flights", "fetch_hotels"}
@@ -643,24 +642,24 @@ def run_agent():
             print("Searching...\n")
 
             for event in graph.stream(initial_state, config, stream_mode="values"):
-                # --- DEBUG ---
-                print("\n" + "="*40)
-                print("--- FULL STATE SNAPSHOT ---")
+                # # --- DEBUG ---
+                # print("\n" + "="*40)
+                # print("--- FULL STATE SNAPSHOT ---")
                 
-                # הדפסת כל השדות ב-State חוץ מההודעות (כדי למנוע הצפה)
-                state_data = {k: v for k, v in event.items() if k != "messages"}
-                print(f"Current Metadata: {state_data}")
+                # # הדפסת כל השדות ב-State חוץ מההודעות (כדי למנוע הצפה)
+                # state_data = {k: v for k, v in event.items() if k != "messages"}
+                # print(f"Current Metadata: {state_data}")
                 
-                # הדפסת מספר ההודעות הכולל בזיכרון
-                print(f"Total messages in memory: {len(event['messages'])}")
+                # # הדפסת מספר ההודעות הכולל בזיכרון
+                # print(f"Total messages in memory: {len(event['messages'])}")
                 
-                # ההודעה האחרונה (הדיבוג הקיים שלך)
-                last_msg = event["messages"][-1]
-                print(f"Last Actor: {last_msg.__class__.__name__}")
-                print(f"Last Message Content: {last_msg.content}")
+                # # ההודעה האחרונה (הדיבוג הקיים שלך)
+                # last_msg = event["messages"][-1]
+                # print(f"Last Actor: {last_msg.__class__.__name__}")
+                # print(f"Last Message Content: {last_msg.content}")
 
-                print("="*40)
-                # --- DEBUG ---
+                # print("="*40)
+                # # --- DEBUG ---
                 last = event["messages"][-1]
                 content = last.content
                 if isinstance(content, list):
