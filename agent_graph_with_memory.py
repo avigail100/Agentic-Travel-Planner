@@ -177,9 +177,10 @@ def preference_persist_node(state: AgentState):
 
 def alternatives_injector_node(state: AgentState):
     """
-    Injects a structured system message when the LLM signalled NO_MATCH (Case B),
-    then routes back to call_model so all normal agent logic still applies.
-    Handles multiple missing items (flight + hotel + activity) in one pass.
+    Injects a structured system message when no results were found — either because
+    the destination doesn't exist (lookup NO_MATCH) or because it exists but has no
+    inventory for this specific route/city (fetch failure).
+    Routes back to call_model so all normal agent logic (step limits, errors) still applies.
     """
     no_matches = _extract_no_matches(state)
 
@@ -194,32 +195,33 @@ def alternatives_injector_node(state: AgentState):
     items_block = ""
     for nm in no_matches:
         avail = nm.get("available_locations") or []
-        avail_str = str(avail) if avail else "(see DB)"
-        items_block += (
-            f"\n- '{nm['search_term']}' — available alternatives: {avail_str}"
-        )
+        avail_str = f"Available options in DB: {avail}" if avail else ""
+        items_block += f"\n- {nm['search_term']}. {avail_str}"
 
     if not items_block:
         items_block = "\n- (see tool results for details)"
 
-    instruction = f"""[SYSTEM — GENUINE DESTINATION MISMATCH]
-The user requested one or more destinations that are not in our database and have no semantic equivalent:
+    instruction = f"""[SYSTEM — NO RESULTS FOUND, SUGGEST ALTERNATIVES]
+The user's request returned no results for one or more items:
 {items_block}
 
 {pref_block}
 
 Instructions:
-1. Clearly tell the user that the exact destination(s) above are not available.
-2. For each missing item, suggest 2–4 alternatives from the available list.
+1. Clearly tell the user that the exact request could not be fulfilled (no matching flights/hotels/activities).
+2. Proactively suggest 2–4 relevant alternatives WITHOUT waiting to be asked.
    For each suggestion explain in one sentence WHY it was chosen:
    - Same geographic region or continent
    - Similar climate or travel season
    - Similar luxury/budget level (infer from the request or preferences)
    - Similar travel style (beach, culture, adventure, city, nature…)
    - Alignment with saved user preferences
-3. If multiple items are missing, address each one.
+   - For flights: other destinations served from the same origin
+3. If multiple items have no results, address each one.
 4. End by asking the user if they'd like to plan a trip to any of the suggested alternatives.
-5. Do NOT call any more tools. Respond directly to the user."""
+5. If user preferences exist (like a preferred airline), call fetch_flights with the origin city to see 
+which destinations match that preference before suggesting alternatives.
+"""
 
     return {
         "messages": [SystemMessage(content=instruction)],
@@ -259,30 +261,62 @@ def call_model(state: AgentState):
 
 def _extract_no_matches(state: AgentState) -> list[dict]:
     """
-    Scans current-turn ToolMessages from lookup_location_options for NO_MATCH signals.
-    The LLM emits the string 'NO_MATCH:<search_term>' when it decides Case B.
-    Returns a list of dicts: [{search_term, service_type, available_locations}, ...]
+    Scans current-turn ToolMessages for two kinds of "no result" signals:
+
+    1. lookup_location_options returned a no_direct_match dict AND the LLM
+       decided Case B (genuine mismatch) — detectable because the LLM then
+       writes the string "NO_MATCH:<term>" as its *next* AIMessage content
+       before calling another tool, OR because the tool result itself is a
+       no_direct_match dict with no subsequent successful fetch.
+
+    2. A fetch tool (fetch_flights, fetch_hotels, fetch_activities) returned
+       a plain "No X found" error string — meaning the location existed in
+       the lookup table but has no actual inventory for this route/city.
+
+    Returns a list of dicts: [{search_term, source, available_locations}, ...]
     """
     no_matches = []
-    for msg in _current_turn_tool_messages(state):
+    tool_msgs = _current_turn_tool_messages(state)
+
+    # --- Case B signal: LLM wrote "NO_MATCH:<term>" after lookup returned no_direct_match ---
+    for msg in tool_msgs:
         if getattr(msg, "name", None) != "lookup_location_options":
             continue
         content = msg.content
-        # The LLM writes "NO_MATCH:<term>" as its tool response when Case B applies
         if isinstance(content, str) and content.startswith("NO_MATCH:"):
             search_term = content[len("NO_MATCH:"):].strip()
-            no_matches.append({"search_term": search_term, "available_locations": []})
+            no_matches.append({"search_term": search_term, "source": "lookup", "available_locations": []})
         else:
-            # Also handle dict case (tool itself may return no_direct_match structure)
             try:
                 data = json.loads(content) if isinstance(content, str) else content
                 if isinstance(data, dict) and data.get("no_direct_match"):
-                    # The LLM chose Case B and stored it — treat as NO_MATCH
-                    # (This path is a safety net; normally the LLM emits the string above)
-                    pass
+                    # Tool returned no_direct_match; include its available list
+                    # so alternatives_injector can reason over it even if the
+                    # LLM didn't explicitly write NO_MATCH:<term>
+                    no_matches.append({
+                        "search_term": data.get("search_term", "requested location"),
+                        "source": "lookup",
+                        "available_locations": data.get("available_locations", []),
+                    })
             except (json.JSONDecodeError, TypeError):
                 pass
+
+    # --- Fetch failure: tool returned a "No X found" plain-text error ---
+    FETCH_TOOLS = {"fetch_flights", "fetch_hotels", "fetch_activities"}
+    NO_RESULT_PHRASES = ("no flights found", "no hotels found", "no activities found")
+    for msg in tool_msgs:
+        if getattr(msg, "name", None) not in FETCH_TOOLS:
+            continue
+        content = msg.content if isinstance(msg.content, str) else ""
+        if any(phrase in content.lower() for phrase in NO_RESULT_PHRASES):
+            no_matches.append({
+                "search_term": content,   # e.g. "No flights found from TLV to London."
+                "source": "fetch",
+                "available_locations": [],
+            })
+
     return no_matches
+
 
 def step_limit_node(_state: AgentState):
     return {
@@ -496,7 +530,7 @@ builder.add_conditional_edges(
     "preference_persist", check_tool_errors,
     {"alternatives": "alternatives_injector", "tool_error": "tool_error", "agent": "agent"},
 )
-# alternatives_injector injects a SystemMessage then hands back to call_model,
+# alternatives_injector injects a SystemMessage then hands back to call_model.
 builder.add_edge("alternatives_injector", "agent")
 builder.add_edge("tool_error", "formatter")
 builder.add_edge("step_limit", "formatter")
