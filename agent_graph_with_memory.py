@@ -43,6 +43,10 @@ SYSTEM_PROMPT = """You are a proactive travel planning assistant. Use the availa
 Rules:
 - Call tools immediately with reasonable assumptions — do not ask clarifying questions first.
   If the user says "from Israel", use origin=TLV. If they say "to Japan", use destination=Tokyo.
+- Step-by-Step Logic for the lookup_location_options tool:
+    1. Use lookup_location_options to see if the requested cities/countries exist or have synonyms in our database.
+    2. If you find a logical match (e.g., 'Israel' -> 'TLV'), proceed with the search.
+    3. IF NO LOGICAL MATCH IS FOUND, do not guess. Clearly state that the specific destination is unavailable.
 - When a trip requires both flight and hotel data, call fetch_flights AND fetch_hotels in the
   same response so they run in parallel — do not wait for one before calling the other.
 - Once you have tool results, give a direct answer. Do not ask follow-up questions if you
@@ -159,14 +163,76 @@ def preference_persist_node(state: AgentState):
     """Reads save_preference tool results from the current turn and merges into state."""
     existing = state.get("user_preferences") or {}
     updated = dict(existing)
+
     for msg in _current_turn_tool_messages(state):
         if getattr(msg, "name", None) == "save_preference" and msg.content.startswith("saved:"):
             k, v = msg.content[6:].split("=", 1)
             updated[k] = v
             print(f"\n[Memory] Saved preference: {k}={v}")
+
     if updated == existing:
         return {}
     return {"user_preferences": updated}
+
+
+def alternatives_injector_node(state: AgentState):
+    """
+    Injects a structured system message into the conversation when NO_MATCH was detected,
+    then routes back to call_model.
+
+    Collects ALL no_match signals from this turn (flight, hotel, activity, etc.)
+    so the agent can suggest alternatives for every missing item in one response.
+    """
+    # Gather every NO_MATCH that was recorded in this turn's tool messages
+    no_matches = []
+    for msg in _current_turn_tool_messages(state):
+        if getattr(msg, "name", None) == "lookup_location_options":
+            try:
+                content = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
+                if isinstance(content, dict) and content.get("status") == "NO_MATCH":
+                    no_matches.append(content)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    prefs = state.get("user_preferences") or {}
+    pref_block = (
+        "User's saved preferences:\n" +
+        "\n".join(f"  - {k.replace('_', ' ').title()}: {v}" for k, v in prefs.items())
+        if prefs else
+        "No saved preferences on file — use geographic and contextual reasoning only."
+    )
+
+    # Build one block per missing item
+    items_block = ""
+    for nm in no_matches:
+        items_block += (
+            f"\n- Requested '{nm.get('search_term')}' for service '{nm.get('service_type')}'. "
+            f"Available options in DB: {nm.get('available_locations', [])}"
+        )
+
+    instruction = f"""[SYSTEM — NO_MATCH DETECTED]
+The user's request could not be fulfilled exactly because one or more locations were not found in our database:
+{items_block}
+
+{pref_block}
+
+Instructions:
+1. Clearly inform the user that no exact match was found for each missing item.
+2. For each missing item, suggest 2-4 relevant alternatives from the available list above.
+   Explain in one sentence WHY each alternative was chosen, using criteria such as:
+   - Same geographic region or continent
+   - Similar climate or travel season
+   - Similar luxury/budget level (infer from the request or preferences)
+   - Similar travel style (beach, culture, adventure, city, nature…)
+   - Alignment with saved user preferences
+3. If multiple items are missing (e.g. both flight destination and hotel city), address each one.
+4. End by asking the user if they'd like to continue planning with any of the suggested alternatives.
+5. Do NOT call any more tools. Respond directly."""
+
+    return {
+        "messages": [SystemMessage(content=instruction)],
+        "no_match_info": {},   # reset so it doesn't re-trigger on next turn
+    }
 
 
 def personalization_node(state: AgentState):
@@ -212,6 +278,7 @@ def step_limit_node(_state: AgentState):
 
 
 def validator_node(state: AgentState):
+    
     tool_names_called = {
         m.name for m in state["messages"] 
         if m.__class__.__name__ == "ToolMessage"
@@ -334,6 +401,22 @@ def should_continue(state: AgentState):
 
 
 def check_tool_errors(state: AgentState):
+    """
+    Runs after preference_persist. Decides the next hop:
+    - 'alternatives' if any lookup_location_options call returned NO_MATCH this turn
+    - 'tool_error'   if a required tool returned a hard error string
+    - 'agent'        otherwise (normal continuation)
+    """
+    for msg in _current_turn_tool_messages(state):
+        if getattr(msg, "name", None) == "lookup_location_options":
+            try:
+                content = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
+                if isinstance(content, dict) and content.get("status") == "NO_MATCH":
+                    print(f"\n[Router] NO_MATCH detected → alternatives_injector")
+                    return "alternatives"
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     # required_tools = {"fetch_flights", "fetch_hotels"}
     required_tools = {}
     for msg in reversed(state["messages"]):
@@ -375,6 +458,7 @@ builder.add_node("personalization", personalization_node)
 builder.add_node("agent", call_model)
 builder.add_node("tools", ToolNode(tools))
 builder.add_node("preference_persist", preference_persist_node)
+builder.add_node("alternatives_injector", alternatives_injector_node)
 builder.add_node("tool_error", tool_error_node)
 builder.add_node("step_limit", step_limit_node)
 builder.add_node("validator", validator_node)
@@ -398,8 +482,10 @@ builder.add_conditional_edges(
 builder.add_edge("tools", "preference_persist")
 builder.add_conditional_edges(
     "preference_persist", check_tool_errors,
-    {"tool_error": "tool_error", "agent": "agent"},
+    {"alternatives": "alternatives_injector", "tool_error": "tool_error", "agent": "agent"},
 )
+# alternatives_injector injects a SystemMessage then hands back to call_model
+builder.add_edge("alternatives_injector", "agent")
 builder.add_edge("tool_error", "formatter")
 builder.add_edge("step_limit", "formatter")
 builder.add_conditional_edges(
@@ -515,13 +601,17 @@ def run_agent():
                 print("\n" + "="*40)
                 print("--- FULL STATE SNAPSHOT ---")
                 
+                # הדפסת כל השדות ב-State חוץ מההודעות (כדי למנוע הצפה)
                 state_data = {k: v for k, v in event.items() if k != "messages"}
                 print(f"Current Metadata: {state_data}")
                 
+                # הדפסת מספר ההודעות הכולל בזיכרון
                 print(f"Total messages in memory: {len(event['messages'])}")
                 
+                # ההודעה האחרונה (הדיבוג הקיים שלך)
                 last_msg = event["messages"][-1]
                 print(f"Last Actor: {last_msg.__class__.__name__}")
+                
                 print(f"Last Message Content: {last_msg.content}")
                 print("="*40)
                 # --- DEBUG ---

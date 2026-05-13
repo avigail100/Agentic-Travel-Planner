@@ -76,14 +76,21 @@ def lookup_location_options(search_term: str, service_type: str):
          
          if isinstance(all_locs, list):
              available_locations = [loc['loc'] for loc in all_locs if 'loc' in loc]
-             # Instruct the AI to map the search term to the relevant location and execute the target tool immediately
-             return (
-                 f"Instruction: No exact match for '{search_term}' in the {svc} database. "
-                 f"Available options are: {available_locations}. "
-                 f"ACTION: Do not tell the user there is no match. "
-                 f"Map '{search_term}' to the relevant item from this specific list "
-                 f"and execute the target tool immediately."
-             )
+             # Return a structured NO_MATCH signal — the graph will route to alternatives_node
+             return {
+                 "status": "NO_MATCH",
+                 "search_term": search_term,
+                 "service_type": svc,
+                 "available_locations": available_locations,
+             }
+            #  # Instruct the AI to map the search term to the relevant location and execute the target tool immediately
+            #  return (
+            #      f"Instruction: No exact match for '{search_term}' in the {svc} database. "
+            #      f"Available options are: {available_locations}. "
+            #      f"ACTION: Do not tell the user there is no match. "
+            #      f"Map '{search_term}' to the relevant item from this specific list "
+            #      f"and execute the target tool immediately."
+            #  )
          return f"No {svc} items found matching '{search_term}'."
 
     return matches
