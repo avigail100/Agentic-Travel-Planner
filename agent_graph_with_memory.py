@@ -177,22 +177,11 @@ def preference_persist_node(state: AgentState):
 
 def alternatives_injector_node(state: AgentState):
     """
-    Injects a structured system message into the conversation when NO_MATCH was detected,
-    then routes back to call_model.
-
-    Collects ALL no_match signals from this turn (flight, hotel, activity, etc.)
-    so the agent can suggest alternatives for every missing item in one response.
+    Injects a structured system message when the LLM signalled NO_MATCH (Case B),
+    then routes back to call_model so all normal agent logic still applies.
+    Handles multiple missing items (flight + hotel + activity) in one pass.
     """
-    # Gather every NO_MATCH that was recorded in this turn's tool messages
-    no_matches = []
-    for msg in _current_turn_tool_messages(state):
-        if getattr(msg, "name", None) == "lookup_location_options":
-            try:
-                content = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
-                if isinstance(content, dict) and content.get("status") == "NO_MATCH":
-                    no_matches.append(content)
-            except (json.JSONDecodeError, TypeError):
-                pass
+    no_matches = _extract_no_matches(state)
 
     prefs = state.get("user_preferences") or {}
     pref_block = (
@@ -202,36 +191,38 @@ def alternatives_injector_node(state: AgentState):
         "No saved preferences on file — use geographic and contextual reasoning only."
     )
 
-    # Build one block per missing item
     items_block = ""
     for nm in no_matches:
+        avail = nm.get("available_locations") or []
+        avail_str = str(avail) if avail else "(see DB)"
         items_block += (
-            f"\n- Requested '{nm.get('search_term')}' for service '{nm.get('service_type')}'. "
-            f"Available options in DB: {nm.get('available_locations', [])}"
+            f"\n- '{nm['search_term']}' — available alternatives: {avail_str}"
         )
 
-    instruction = f"""[SYSTEM — NO_MATCH DETECTED]
-The user's request could not be fulfilled exactly because one or more locations were not found in our database:
+    if not items_block:
+        items_block = "\n- (see tool results for details)"
+
+    instruction = f"""[SYSTEM — GENUINE DESTINATION MISMATCH]
+The user requested one or more destinations that are not in our database and have no semantic equivalent:
 {items_block}
 
 {pref_block}
 
 Instructions:
-1. Clearly inform the user that no exact match was found for each missing item.
-2. For each missing item, suggest 2-4 relevant alternatives from the available list above.
-   Explain in one sentence WHY each alternative was chosen, using criteria such as:
+1. Clearly tell the user that the exact destination(s) above are not available.
+2. For each missing item, suggest 2–4 alternatives from the available list.
+   For each suggestion explain in one sentence WHY it was chosen:
    - Same geographic region or continent
    - Similar climate or travel season
    - Similar luxury/budget level (infer from the request or preferences)
    - Similar travel style (beach, culture, adventure, city, nature…)
    - Alignment with saved user preferences
-3. If multiple items are missing (e.g. both flight destination and hotel city), address each one.
-4. End by asking the user if they'd like to continue planning with any of the suggested alternatives.
-5. Do NOT call any more tools. Respond directly."""
+3. If multiple items are missing, address each one.
+4. End by asking the user if they'd like to plan a trip to any of the suggested alternatives.
+5. Do NOT call any more tools. Respond directly to the user."""
 
     return {
         "messages": [SystemMessage(content=instruction)],
-        "no_match_info": {},   # reset so it doesn't re-trigger on next turn
     }
 
 
@@ -265,6 +256,33 @@ def call_model(state: AgentState):
         }
     return {"messages": [response], "step_count": state.get("step_count", 0) + 1}
 
+
+def _extract_no_matches(state: AgentState) -> list[dict]:
+    """
+    Scans current-turn ToolMessages from lookup_location_options for NO_MATCH signals.
+    The LLM emits the string 'NO_MATCH:<search_term>' when it decides Case B.
+    Returns a list of dicts: [{search_term, service_type, available_locations}, ...]
+    """
+    no_matches = []
+    for msg in _current_turn_tool_messages(state):
+        if getattr(msg, "name", None) != "lookup_location_options":
+            continue
+        content = msg.content
+        # The LLM writes "NO_MATCH:<term>" as its tool response when Case B applies
+        if isinstance(content, str) and content.startswith("NO_MATCH:"):
+            search_term = content[len("NO_MATCH:"):].strip()
+            no_matches.append({"search_term": search_term, "available_locations": []})
+        else:
+            # Also handle dict case (tool itself may return no_direct_match structure)
+            try:
+                data = json.loads(content) if isinstance(content, str) else content
+                if isinstance(data, dict) and data.get("no_direct_match"):
+                    # The LLM chose Case B and stored it — treat as NO_MATCH
+                    # (This path is a safety net; normally the LLM emits the string above)
+                    pass
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return no_matches
 
 def step_limit_node(_state: AgentState):
     return {
@@ -403,19 +421,13 @@ def should_continue(state: AgentState):
 def check_tool_errors(state: AgentState):
     """
     Runs after preference_persist. Decides the next hop:
-    - 'alternatives' if any lookup_location_options call returned NO_MATCH this turn
+    - 'alternatives' if the LLM signalled NO_MATCH (Case B) for any lookup this turn
     - 'tool_error'   if a required tool returned a hard error string
     - 'agent'        otherwise (normal continuation)
     """
-    for msg in _current_turn_tool_messages(state):
-        if getattr(msg, "name", None) == "lookup_location_options":
-            try:
-                content = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
-                if isinstance(content, dict) and content.get("status") == "NO_MATCH":
-                    print(f"\n[Router] NO_MATCH detected → alternatives_injector")
-                    return "alternatives"
-            except (json.JSONDecodeError, TypeError):
-                pass
+    if _extract_no_matches(state):
+        print(f"\n[Router] NO_MATCH signal detected → alternatives_injector")
+        return "alternatives"
 
     # required_tools = {"fetch_flights", "fetch_hotels"}
     required_tools = {}
@@ -484,7 +496,7 @@ builder.add_conditional_edges(
     "preference_persist", check_tool_errors,
     {"alternatives": "alternatives_injector", "tool_error": "tool_error", "agent": "agent"},
 )
-# alternatives_injector injects a SystemMessage then hands back to call_model
+# alternatives_injector injects a SystemMessage then hands back to call_model,
 builder.add_edge("alternatives_injector", "agent")
 builder.add_edge("tool_error", "formatter")
 builder.add_edge("step_limit", "formatter")
@@ -611,8 +623,8 @@ def run_agent():
                 # ההודעה האחרונה (הדיבוג הקיים שלך)
                 last_msg = event["messages"][-1]
                 print(f"Last Actor: {last_msg.__class__.__name__}")
-                
                 print(f"Last Message Content: {last_msg.content}")
+
                 print("="*40)
                 # --- DEBUG ---
                 last = event["messages"][-1]

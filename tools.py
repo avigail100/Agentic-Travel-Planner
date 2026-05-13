@@ -26,74 +26,77 @@ def _run_query(query: str, params: tuple = ()):
 def lookup_location_options(search_term: str, service_type: str):
     """
     Use this tool FIRST to resolve ANY location mention based on the service_type.
-    
-    IMPORTANT: If this tool returns a list of "Available locations", 
-    DO NOT apologize or ask the user for clarification. Map the requested location 
-    to the correct item in the returned list and IMMEDIATELY call the target tool.
-    
-    Input: 
-    - search_term (example: 'Israel', 'France', 'Lod', 'Paris').
-    - service_type: 'flight', 'hotel', 'activity', "best_season", "car_rental", "visa_requirements", "time_difference"
+
+    When this tool returns a list of available locations and NO exact match was found,
+    YOU must decide — before doing anything else — whether the situation is:
+
+    CASE A — Semantic equivalence (country→hub, city→airport, region→main city):
+        Examples: "Israel" → "TLV", "Rechovot" → "TLV", "Britain" → "London",
+                  "Japan" → "Tokyo", "Ben Gurion" → "TLV"
+        Action: Silently map to the correct item from the list and immediately call
+                the target tool. Do NOT inform the user. Do NOT ask for confirmation.
+
+    CASE B — Genuine destination mismatch (the user asked for somewhere we don't serve):
+        Examples: User asked for "Buenos Aires" and we only have European cities.
+        Action: Return the string "NO_MATCH:<search_term>" so the graph can
+                route to the alternatives flow.
+                Format exactly: NO_MATCH:<original search term>
+
+    Input:
+    - search_term: e.g. 'Israel', 'France', 'Lod', 'Paris'.
+    - service_type: 'flight', 'hotel', 'activity', 'best_season', 'car_rental',
+                    'visa_requirements', 'time_difference'
     """
-    search_term = search_term.strip().lower()
+    raw = search_term.strip().lower()
     svc = service_type.strip().lower()
-    like_param = f"%{search_term}%"
-    
-    # Map the service type to the relevant table and columns for searching
+    like_param = f"%{raw}%"
+
     SERVICE_MAP = {
-        "flight": {"table": "flights", "cols": ["origin", "destination"]},
-        "hotel": {"table": "hotels", "cols": ["city"]},
-        "activity": {"table": "activities", "cols": ["city"]},
-        "best_season": {"table": "best_seasons", "cols": ["city"]},
-        "car_rental": {"table": "car_rentals", "cols": ["city"]},
+        "flight":            {"table": "flights",           "cols": ["origin", "destination"]},
+        "hotel":             {"table": "hotels",            "cols": ["city"]},
+        "activity":          {"table": "activities",        "cols": ["city"]},
+        "best_season":       {"table": "best_seasons",      "cols": ["city"]},
+        "car_rental":        {"table": "car_rentals",       "cols": ["city"]},
         "visa_requirements": {"table": "visa_requirements", "cols": ["origin", "destination"]},
-        "time_difference": {"table": "time_differences", "cols": ["origin", "destination"]}
+        "time_difference":   {"table": "time_differences",  "cols": ["origin", "destination"]},
     }
 
-    # If the service type is invalid, return an error message with valid options
     if svc not in SERVICE_MAP:
-        valid_services = list(SERVICE_MAP.keys())
-        return f"ERROR: '{svc}' is invalid, it must be one of: {valid_services}"
+        return f"ERROR: '{svc}' is invalid, must be one of: {list(SERVICE_MAP.keys())}"
 
-    # Dynamically build the query based on the service type's relevant table and columns
-    config = SERVICE_MAP[svc]
-    table = config["table"]
-    cols = config["cols"]
+    table = SERVICE_MAP[svc]["table"]
+    cols  = SERVICE_MAP[svc]["cols"]
 
-    # Build a query that searches for the search term in all relevant columns for that service type using UNION to combine results
-    query_parts = [f"SELECT DISTINCT {col} AS available_location FROM {table} WHERE LOWER({col}) LIKE ?" for col in cols]
+    # Direct LIKE search first
+    query_parts = [
+        f"SELECT DISTINCT {col} AS available_location FROM {table} WHERE LOWER({col}) LIKE ?"
+        for col in cols
+    ]
     query = " UNION ".join(query_parts)
-    params = tuple([like_param] * len(cols))
-    
-    matches = _run_query(query, params)
+    matches = _run_query(query, tuple([like_param] * len(cols)))
 
-    # If no matches found, fetch all available locations for that service type and return an instruction to map the search term to the relevant location
-    if not matches or isinstance(matches, str):
-         all_loc_parts = [f"SELECT DISTINCT {col} AS loc FROM {table}" for col in cols]
-         all_loc_query = " UNION ".join(all_loc_parts)
-         
-         all_locs = _run_query(all_loc_query)
-         
-         if isinstance(all_locs, list):
-             available_locations = [loc['loc'] for loc in all_locs if 'loc' in loc]
-             # Return a structured NO_MATCH signal — the graph will route to alternatives_node
-             return {
-                 "status": "NO_MATCH",
-                 "search_term": search_term,
-                 "service_type": svc,
-                 "available_locations": available_locations,
-             }
-            #  # Instruct the AI to map the search term to the relevant location and execute the target tool immediately
-            #  return (
-            #      f"Instruction: No exact match for '{search_term}' in the {svc} database. "
-            #      f"Available options are: {available_locations}. "
-            #      f"ACTION: Do not tell the user there is no match. "
-            #      f"Map '{search_term}' to the relevant item from this specific list "
-            #      f"and execute the target tool immediately."
-            #  )
-         return f"No {svc} items found matching '{search_term}'."
+    if matches and not isinstance(matches, str):
+        return matches
 
-    return matches
+    # No direct match — return full list so the LLM can apply CASE A or CASE B logic
+    all_loc_parts = [f"SELECT DISTINCT {col} AS loc FROM {table}" for col in cols]
+    all_locs = _run_query(" UNION ".join(all_loc_parts))
+    available_locations = (
+        [loc["loc"] for loc in all_locs if "loc" in loc]
+        if isinstance(all_locs, list) else []
+    )
+
+    return {
+        "no_direct_match": True,
+        "search_term": search_term.strip(),
+        "service_type": svc,
+        "available_locations": available_locations,
+        "instruction": (
+            "Decide: is this semantic equivalence (CASE A) or a genuine mismatch (CASE B)? "
+            "CASE A → silently pick the correct item from available_locations and call the target tool immediately. "
+            "CASE B → respond with the exact string 'NO_MATCH:<search_term>'."
+        ),
+    }
 
 @tool
 def fetch_flights(origin: str, destination: str = None):
