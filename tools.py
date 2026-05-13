@@ -94,7 +94,7 @@ def lookup_location_options(search_term: str, service_type: str):
         "instruction": (
             "Decide: is this semantic equivalence (CASE A) or a genuine mismatch (CASE B)? "
             "CASE A → silently pick the correct item from available_locations and call the target tool immediately. "
-            "CASE B → respond with the exact string 'NO_MATCH:<search_term>'."
+            "CASE B → do not retry, return the exact string:'NO_MATCH:{search_term}'."
         ),
     }
 
@@ -125,6 +125,43 @@ def fetch_flights(origin: str, destination: str = None):
                 return f"No flights found from {origin} to {destination}."
         return f"No flights found departing from {origin}."
 
+    return matches
+
+@tool
+def find_connecting_flights(origin: str, destination: str):
+    """
+    Search for connecting flights with exactly one stop (layover) from origin to destination.
+    Use this if direct flights (fetch_flights) are not available.
+    Returns a list of flight combinations including the layover city, flight numbers, and total price.
+    """
+    # the qury routes with exactly one layover by joining the flights table twice to find pairs of flights where the destination of the first flight matches the origin of the second flight, 
+    # and the first flight departs from the specified origin while the second flight arrives at the specified destination. 
+    # It returns details about both flights and calculates the total price for the connecting trip.
+    query = """
+    SELECT 
+        f1.origin AS origin, 
+        f1.destination AS layover, 
+        f2.destination AS final_destination,
+        f1.airline AS airline_1, 
+        f1.flight_number AS flight_1, 
+        f1.price AS price_1,
+        f2.airline AS airline_2, 
+        f2.flight_number AS flight_2, 
+        f2.price AS price_2,
+        (f1.price + f2.price) AS total_price
+    FROM flights f1
+    JOIN flights f2 ON LOWER(f1.destination) = LOWER(f2.origin)
+    WHERE LOWER(f1.origin) = ? AND LOWER(f2.destination) = ?
+    """
+    
+    origin_param = origin.strip().lower()
+    dest_param = destination.strip().lower()
+    
+    matches = _run_query(query, (origin_param, dest_param))
+    
+    if not matches or isinstance(matches, str):
+        return f"No connecting flights found with exactly one stop from {origin} to {destination}."
+    
     return matches
 
 @tool
@@ -217,14 +254,21 @@ def fetch_currency_exchange_rate(origin_currency: str, destination_currency: str
     Returns the exchange rate as of today.
     """
     query = "SELECT exchange_rate FROM exchange_rates WHERE LOWER(origin_currency) = ? AND LOWER(destination_currency) = ?"
+
     origin_param = origin_currency.strip().lower()
     dest_param = destination_currency.strip().lower()
     
-    matches = _run_query(query, (origin_param, dest_param))
+    # First try to find the direct exchange rate
+    res = _run_query(query, (origin_param, dest_param))
     
-    if not matches or isinstance(matches, str):
-        return f"No exchange rate information found for {origin_currency} to {destination_currency}."
-    return matches
+    if res and not isinstance(res, str):
+        return res
+
+    # if no direct exchange rate is found, try to find the reverse exchange rate and invert it
+    res_reverse = _run_query(query, (dest_param, origin_param))
+    if res_reverse and not isinstance(res_reverse, str):
+        original_rate = res_reverse[0]['exchange_rate']
+        return [{"exchange_rate": 1 / original_rate}]
 
 @tool
 def convert_cost_to_origin_currency(cost_in_destination_currency: float, exchange_rate: float):
