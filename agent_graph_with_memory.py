@@ -31,7 +31,7 @@ from tools import (
     fetch_visa_requirements, fetch_time_difference,
     calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
-    fetch_seasonal_recommendations, convert_time_to_destination_timezone,
+    fetch_seasonal_recommendations, find_destinations_by_preference, convert_time_to_destination_timezone,
     lookup_location_options, find_connecting_flights, save_preference,
 )
 
@@ -117,7 +117,7 @@ tools = [
     fetch_visa_requirements, fetch_time_difference,
     calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
-    fetch_seasonal_recommendations, convert_time_to_destination_timezone,
+    fetch_seasonal_recommendations, find_destinations_by_preference, convert_time_to_destination_timezone,
     lookup_location_options, find_connecting_flights,
     save_preference, 
 ]

@@ -60,7 +60,8 @@ def create_travel_db():
         origin TEXT,
         destination TEXT,
         policy TEXT,
-        days_allowed_without_visa INTEGER
+        days_allowed_without_visa INTEGER,
+        visa_type TEXT
     )
     """)
 
@@ -80,7 +81,9 @@ def create_travel_db():
         city TEXT,
         company TEXT,
         price_per_day INTEGER,
-        car_type TEXT
+        car_type TEXT,
+        transmission TEXT,
+        seats INTEGER
     )
     """)
 
@@ -89,7 +92,10 @@ def create_travel_db():
         id INTEGER PRIMARY KEY,
         city TEXT,
         season TEXT,
-        months TEXT
+        months TEXT,
+        reason TEXT,
+        start_month INTEGER,
+        end_month INTEGER
     )
     """)
 
@@ -121,10 +127,25 @@ def create_travel_db():
     ('New York', 'Brooklyn Budget Stay', 110, 2, 'WiFi', 7.9, 'Standard', 'No'),
     # Rome
     ('Rome', 'Colosseum Hotel', 210, 4, 'Breakfast, Rooftop', 8.7, 'Deluxe', 'Yes'),
+    ('Rome', 'Budget Rome Inn', 90, 2, 'WiFi', 7.6, 'Standard', 'No'),
     # Barcelona
     ('Barcelona', 'Beachside Resort', 260, 4, 'Pool, Sea View', 8.8, 'Suite', 'Yes'),
     # Bangkok
-    ('Bangkok', 'Bangkok Palace', 180, 4, 'Pool, Gym', 8.4, 'Deluxe', 'Yes')
+    ('Bangkok', 'Bangkok Palace', 180, 4, 'Pool, Gym', 8.4, 'Deluxe', 'Yes'),
+    # Dubai
+    ('Dubai', 'Palm Luxury Resort', 520, 5, 'Private Beach, Spa, Pool', 9.5, 'Suite', 'Yes'),
+    # Athens
+    ('Athens', 'Acropolis View Hotel', 170, 3, 'Breakfast, Rooftop', 8.4, 'Standard', 'Yes'),
+    # Larnaca
+    ('Larnaca', 'Sunny Coast Hotel', 140, 3, 'Beach Access, Pool', 8.1, 'Standard', 'Yes'),
+    # Amsterdam
+    ('Amsterdam', 'Canal Boutique Hotel', 240, 4, 'Canal View, Breakfast', 8.8, 'Deluxe', 'Yes'),
+    # Berlin
+    ('Berlin', 'Berlin Central Stay', 130, 3, 'WiFi, Breakfast', 8.0, 'Standard', 'Yes'),
+    # Los Angeles
+    ('Los Angeles', 'Sunset Boulevard Hotel', 390, 4, 'Pool, Gym', 8.7, 'Suite', 'Yes'),
+    # Miami
+    ('Miami', 'Ocean Drive Resort', 410, 5, 'Beachfront, Pool, Spa', 9.2, 'Suite', 'Yes'),
     ]
     cursor.executemany("""INSERT INTO hotels 
                        (city, name, price_per_night, stars, amenities, rating, room_type, breakfast_included) 
@@ -216,42 +237,130 @@ def create_travel_db():
 
     # --- Visa Requirements ---
     visa = [
-        ('Israel', 'France', 'No visa required for tourism up to 90 days', 90),
-        ('Israel', 'Japan', 'No visa required for tourism up to 90 days', 90),
-        ('India', 'France', 'Schengen Visa required', 0)
+    ('Israel', 'France', 'No visa required for tourism up to 90 days', 90, 'Tourist'),
+    ('Israel', 'Italy', 'No visa required for tourism up to 90 days', 90, 'Tourist'),
+    ('Israel', 'United Kingdom', 'No visa required for tourism up to 180 days', 180, 'Tourist'),
+    ('Israel', 'United States', 'ESTA approval required before travel', 90, 'ESTA'),
+    ('Israel', 'Japan', 'No visa required for tourism up to 90 days', 90, 'Tourist'),
+    ('Israel', 'Thailand', 'No visa required for tourism up to 30 days', 30, 'Tourist'),
+
+    ('United States', 'France', 'No visa required for tourism up to 90 days', 90, 'Tourist'),
+    ('United States', 'Japan', 'No visa required for tourism up to 90 days', 90, 'Tourist'),
+
+    ('United Kingdom', 'United States', 'ESTA approval required before travel', 90, 'ESTA'),
+
+    ('France', 'Japan', 'No visa required for tourism up to 90 days', 90, 'Tourist'),
+
+    ('Japan', 'Thailand', 'No visa required for tourism up to 30 days', 30, 'Tourist'),
     ]
-    cursor.executemany("INSERT INTO visa_requirements (origin, destination, policy, days_allowed_without_visa) VALUES (?, ?, ?, ?)", visa)
+    cursor.executemany("INSERT INTO visa_requirements (origin, destination, policy, days_allowed_without_visa, visa_type) VALUES (?, ?, ?, ?, ?)", visa)
 
     # --- Exchange Rates ---
     rates = [
-        ('USD', 'ILS', 3.65),
-        ('EUR', 'USD', 1.08),
-        ('GBP', 'USD', 1.27)
+        ('USD', 'EUR', 0.92),
+    ('EUR', 'USD', 1.09),
+
+    ('USD', 'ILS', 3.65),
+    ('ILS', 'USD', 0.27),
+
+    ('EUR', 'ILS', 3.98),
+    ('ILS', 'EUR', 0.25),
+
+    ('USD', 'JPY', 155.2),
+    ('JPY', 'USD', 0.0064),
+
+    ('USD', 'GBP', 0.79),
+    ('GBP', 'USD', 1.27),
+
+    ('USD', 'THB', 36.1),
+    ('THB', 'USD', 0.028),
+
+    ('USD', 'AED', 3.67),
+    ('AED', 'USD', 0.27),
     ]
     cursor.executemany("INSERT INTO exchange_rates (origin_currency, destination_currency, exchange_rate) VALUES (?, ?, ?)", rates)
 
     # --- Car Rentals ---
     cars = [
-        ('CDG', 'Paris', 'Hertz', 45, 'Economy'),
-        ('CDG', 'Paris', 'Avis', 60, 'SUV'),
-        ('LHR', 'London', 'Europcar', 55, 'Compact')
+    # Paris
+    ('CDG', 'Paris', 'Hertz', 70, 'Economy', 'Automatic', 5),
+    ('CDG', 'Paris', 'Avis', 120, 'SUV', 'Automatic', 7),
+    ('ORY', 'Paris', 'Budget', 55, 'Compact', 'Manual', 4),
+    # Rome
+    ('FCO', 'Rome', 'Europcar', 65, 'Compact', 'Manual', 5),
+    # London
+    ('LHR', 'London', 'Sixt', 110, 'Luxury', 'Automatic', 5),
+    ('LGW', 'London', 'Europcar', 75, 'Compact', 'Manual', 5),
+    # Tokyo
+    ('HND', 'Tokyo', 'Toyota Rent', 80, 'Compact', 'Automatic', 5),
+    ('NRT', 'Tokyo', 'Nippon Rent', 140, 'Luxury', 'Automatic', 5),
+    # Bangkok
+    ('BKK', 'Bangkok', 'Budget', 45, 'Economy', 'Automatic', 5),
+    # New York
+    ('JFK', 'New York', 'Enterprise', 95, 'SUV', 'Automatic', 7),
+    ('LGA', 'New York', 'Budget', 60, 'Economy', 'Automatic', 5),
+    # Los Angeles
+    ('LAX', 'Los Angeles', 'Alamo', 130, 'Convertible', 'Automatic', 4),
+    # Dubai
+    ('DXB', 'Dubai', 'Luxury Cars Dubai', 220, 'Luxury SUV', 'Automatic', 7),
+    ('DXB', 'Dubai', 'Budget', 65, 'Economy', 'Automatic', 5),
+    # Athens
+    ('ATH', 'Athens', 'Avis', 55, 'Economy', 'Manual', 5),
+    # Larnaca
+    ('LCA', 'Larnaca', 'Hertz', 50, 'Compact', 'Automatic', 5),
     ]
-    cursor.executemany("INSERT INTO car_rentals (airport, city, company, price_per_day, car_type) VALUES (?, ?, ?, ?, ?)", cars)
+    cursor.executemany("INSERT INTO car_rentals (airport, city, company, price_per_day, car_type, transmission, seats) VALUES (?, ?, ?, ?, ?, ?, ?)", cars)
 
     # --- Best Seasons ---
     seasons = [
-        ('Paris', 'Spring', 'March, April, May'),
-        ('London', 'Summer', 'June, July, August'),
-        ('Tokyo', 'Autumn', 'September, October, November')
+    ('Paris', 'Spring', 'April-June', 'Mild weather, flowers, and comfortable walking conditions', 4, 6),
+    ('London', 'Summer', 'June-August', 'Warmest season with outdoor events and long daylight', 6, 8),
+    ('Rome', 'Spring', 'April-June', 'Warm but not too hot, ideal for sightseeing', 4, 6),
+    ('Barcelona', 'Summer', 'June-September', 'Warm beach weather and sunny days', 6, 9),
+    ('Amsterdam', 'Spring', 'March-May', 'Mild weather and tulip season', 3, 5),
+    ('Berlin', 'Summer', 'May-August', 'Warm weather, festivals, and outdoor nightlife', 5, 8),
+    ('Tokyo', 'Spring', 'March-April', 'Cherry blossom season and pleasant weather', 3, 4),
+    ('Bangkok', 'Winter', 'November-February', 'Warm weather with less humidity than summer', 11, 2),
+    ('Dubai', 'Winter', 'November-March', 'Warm sunny weather without extreme summer heat', 11, 3),
+    ('New York', 'Fall', 'September-November', 'Comfortable weather and beautiful autumn scenery', 9, 11),
+    ('Los Angeles', 'Spring', 'March-May', 'Sunny and warm weather with fewer crowds', 3, 5),
+    ('Athens', 'Spring', 'April-June', 'Warm weather, good for historical tours', 4, 6),
+    ('Larnaca', 'Summer', 'May-September', 'Warm sunny beach season', 5, 9)
     ]
-    cursor.executemany("INSERT INTO best_seasons (city, season, months) VALUES (?, ?, ?)", seasons)
+    cursor.executemany("INSERT INTO best_seasons (city, season, months, reason, start_month, end_month) VALUES (?, ?, ?, ?, ?, ?)", seasons)
 
     # --- Time Differences ---
     times = [
-        ('Tel Aviv', 'Paris', -1),
-        ('Tel Aviv', 'London', -2),
-        ('Tel Aviv', 'Tokyo', 7),
-        ('Paris', 'Tokyo', 8)
+        # Israel
+    ('Tel Aviv', 'Paris', -1),
+    ('Tel Aviv', 'Rome', -1),
+    ('Tel Aviv', 'London', -2),
+    ('Tel Aviv', 'New York', -7),
+    ('Tel Aviv', 'Tokyo', 6),
+    ('Tel Aviv', 'Bangkok', 4),
+    ('Tel Aviv', 'Dubai', 1),
+    ('Tel Aviv', 'Athens', 0),
+    # USA
+    ('New York', 'Tokyo', 13),
+    ('New York', 'Paris', 6),
+    ('New York', 'Bangkok', 12),
+    ('New York', 'London', 5),
+    # UK
+    ('London', 'Tokyo', 9),
+    ('London', 'Bangkok', 7),
+    ('London', 'Paris', 1),
+    # France
+    ('Paris', 'Tokyo', 8),
+    ('Paris', 'Bangkok', 6),
+    ('Paris', 'Dubai', 3),
+    # Japan
+    ('Tokyo', 'Bangkok', -2),
+    ('Tokyo', 'Dubai', -5),
+    # UAE
+    ('Dubai', 'Paris', -3),
+    ('Dubai', 'London', -4),
+    # Greece
+    ('Athens', 'Tokyo', 7),
     ]
     cursor.executemany("INSERT INTO time_differences (origin, destination, hours_difference) VALUES (?, ?, ?)", times)
 
