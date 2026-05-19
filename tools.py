@@ -105,7 +105,8 @@ def fetch_flights(origin: str, destination: str = None):
     If you dont get destintion and only origin, Return all the flights from this origin to all destinations.
     Input: EXACT location names retrieved from the lookup_location_options tool.
             Destination can be None to fetch all flights from the origin to any destination.
-    Returns: List of matching flights with origin, airline, price, and flight number, destination. If no matches, return a message indicating no flights found.
+    Returns: List of matching flights with destination, airline, price, flight number, availability, duration, departure time and arrival time. 
+    If no matches, return a message indicating no flights found.
     """
     
     # Pre-processing inputs to match the database format
@@ -114,10 +115,10 @@ def fetch_flights(origin: str, destination: str = None):
     if destination is not None:
         dest_param = destination.strip().lower()
         # Using LOWER() to ensure case-insensitive matching in the database
-        query = "SELECT airline, price, flight_number, destination FROM flights WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
+        query = "SELECT airline, price, flight_number, destination, duration_hours, departure_time, arrival_time FROM flights WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
         matches = _run_query(query, (origin_param, dest_param))
     else:
-        query = "SELECT airline, price, flight_number, destination FROM flights WHERE LOWER(origin) = ?"
+        query = "SELECT airline, price, flight_number, destination, duration_hours, departure_time, arrival_time FROM flights WHERE LOWER(origin) = ?"
         matches = _run_query(query, (origin_param,))
     
     if not matches or isinstance(matches, str):
@@ -169,8 +170,9 @@ def fetch_hotels(city: str, max_price: int = None):
     """
     Find hotels in a specific city from the database.
     Input: city name (string), max_price (optional integer).
+    When showing hotel results to the user, include ALL returned fields (name, price_per_night, stars, amenities, rating, room_type, breakfast_included) to give them a complete picture of the options available.
     """
-    query = "SELECT name, price_per_night, stars FROM hotels WHERE LOWER(city) = ?"
+    query = "SELECT name, price_per_night, stars, amenities, rating, room_type, breakfast_included FROM hotels WHERE LOWER(city) = ?"
     params = [city.strip().lower()]
     
     if max_price is not None:
@@ -181,6 +183,34 @@ def fetch_hotels(city: str, max_price: int = None):
     
     if not matches or isinstance(matches, str):
         return f"No hotels found in {city} meeting those criteria."
+    return matches
+
+@tool
+def find_hotels_by_amenity(amenity: str, max_price: int = None):
+    """
+    Find hotels across all cities that include a specific amenity.
+    Use this when the user asks for hotels with spa, pool, WiFi, breakfast, etc.,
+    and does not specify a city.
+    """
+
+    query = """
+    SELECT city, name, price_per_night, stars, amenities,
+           rating, room_type, breakfast_included
+    FROM hotels
+    WHERE LOWER(amenities) LIKE ?
+    """
+
+    params = [f"%{amenity.strip().lower()}%"]
+    if max_price is not None:
+        query += " AND price_per_night <= ?"
+        params.append(max_price)
+
+    matches = _run_query(query, tuple(params))
+    print("matches:", matches)
+
+    if not matches or isinstance(matches, str):
+        return f"No hotels found with amenity: {amenity}."
+
     return matches
 
 @tool
@@ -226,8 +256,9 @@ def fetch_activities(city: str, max_price: int = None):
     """
     Find activities in a specific city from the database.
     Input: city name (string), max_price (optional integer).
+    When presenting activity results, include all returned fields (name, price, category, duration, suitable_for) to give the user a comprehensive view of their options.
     """
-    query = "SELECT name, price, category FROM activities WHERE LOWER(city) = ?"
+    query = "SELECT name, price, category, duration, suitable_for FROM activities WHERE LOWER(city) = ?"
     params = [city.strip().lower()]
     
     if max_price is not None:

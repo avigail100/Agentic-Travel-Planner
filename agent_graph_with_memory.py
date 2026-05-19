@@ -27,7 +27,7 @@ import os
 from langchain_groq import ChatGroq
 
 from tools import (
-    fetch_flights, fetch_hotels, fetch_activities,
+    fetch_flights, fetch_hotels, find_hotels_by_amenity, fetch_activities,
     fetch_visa_requirements, fetch_time_difference,
     calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
@@ -113,7 +113,7 @@ class AgentState(TypedDict):
 # ============================================================================
 
 tools = [
-    fetch_flights, fetch_hotels, fetch_activities,
+    fetch_flights, fetch_hotels,find_hotels_by_amenity, fetch_activities,
     fetch_visa_requirements, fetch_time_difference,
     calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
