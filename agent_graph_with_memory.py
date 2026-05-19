@@ -32,7 +32,7 @@ from tools import (
     calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
     fetch_seasonal_recommendations, convert_time_to_destination_timezone,
-    lookup_location_options, find_connecting_flights
+    lookup_location_options, find_connecting_flights, save_preference,
 )
 
 load_dotenv()
@@ -80,6 +80,18 @@ ____   ____  _   _  ____
 |____/ \____/|_| \_||____/
 """
 
+            # Progress message map based on node names in your graph
+
+PROGRESS_MAP = {
+        "intent_classifier": "⚙️  Decoding travel intent...",
+        "context_extractor": "🔍  Extracting budget and context settings...",
+        "personalization":   "✨  Personalizing based on saved preferences...",
+        "tools":             "🧳  Accessing database and searching real-time information...",
+        "alternatives_injector": "💡  Direct destination not found, searching for suitable alternatives...",
+        "cost_calc":         "🧮  Calculating costs and summarizing data...",
+        "budget_check":      "⚖️  Checking compliance with your budget...",
+}
+
 # ============================================================================
 # 1. Shared State
 # ============================================================================
@@ -99,15 +111,6 @@ class AgentState(TypedDict):
 # ============================================================================
 # 2. Model and Tools
 # ============================================================================
-
-@tool
-def save_preference(key: str, value: str) -> str:
-    """Save a user travel preference for future sessions.
-    key: one of preferred_airline, food_preference, travel_style, seat_preference, class_preference
-    value: the preference value (e.g. 'El Al', 'kosher', 'luxury')
-    """
-    return f"saved:{key}={value}"
-
 
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
@@ -152,9 +155,14 @@ def context_extractor_node(state: AgentState):
     """Extracts budget from the user message (per-turn)."""
     text = state["messages"][-1].content
     updates = {}
-    budget_match = re.search(r"\$\s?([\d,]+)", text)
+    # Matches: $1200, 1200$, 1200 dollars, 1200 Dollars, 1200 dollar
+    # budget_match = re.search(r"\$\s?([\d,]+)|([\d,]+)\s?\$", text)
+    budget_match = re.search(r"\$\s?([\d,]+)|([\d,]+)\s?(?:\$|dollars?)", text, re.IGNORECASE)
+    
     if budget_match:
-        updates["total_budget"] = float(budget_match.group(1).replace(",", ""))
+        # Take the first non-None group, remove commas, and convert to float
+        budget_val = budget_match.group(1) or budget_match.group(2)
+        updates["total_budget"] = float(budget_val.replace(",", ""))
     return updates
 
 
@@ -343,24 +351,33 @@ def step_limit_node(_state: AgentState):
 
 
 def validator_node(state: AgentState):
-    
+    # Extract all tool names called in the current turn
     tool_names_called = {
         m.name for m in state["messages"] 
         if m.__class__.__name__ == "ToolMessage"
     }
+    
     intent = state.get("intent", "general")
     missing = []
     
+    # Check if the graph is currently in the alternatives injection phase
     is_suggesting_alternatives = any(
         m.__class__.__name__ == "SystemMessage" and "SUGGEST ALTERNATIVES" in str(m.content) 
         for m in state["messages"][-3:]
     )
     
+    # Context-Aware Validation Logic
     if intent == "full_trip" and not is_suggesting_alternatives:
-        if "fetch_flights" not in tool_names_called:
+        # Check if we have a locked destination city in the state
+        current_city = state.get("current_city") or ""
+        has_destination = (current_city and current_city != "YOUR DESTINATION")
+            
+        # Only require flight data if the user has actually provided a destination
+        if has_destination and "fetch_flights" not in tool_names_called:
             missing.append("flight data")
         # if "fetch_hotels" not in tool_names_called:
         #     missing.append("hotel data")
+            
     return {"missing_data": missing}
 
 
@@ -377,8 +394,16 @@ def retry_injector_node(state: AgentState):
 
 
 def cost_calculator_node(state: AgentState):
+    tool_msgs = _current_turn_tool_messages(state)
+    
+    # First check if calculate_trip_cost was called at all this turn. If not, we should skip the cost calculation and not overwrite calculated_total with 0.0.
+    was_tool_called = any(getattr(msg, "name", None) == "calculate_trip_cost" for msg in tool_msgs)
+    
+    if not was_tool_called:
+        return {} 
+
     total = 0.0
-    for msg in _current_turn_tool_messages(state):
+    for msg in tool_msgs:
         # If the agent called calculate_trip_cost, extract the total_estimate from its result and add to the running total.
         if getattr(msg, "name", None) == "calculate_trip_cost":
             try:
@@ -426,33 +451,54 @@ def formatter_node(state: AgentState):
     clean_text = clean_text.replace("\\n", "\n").strip()
     clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
 
-    # find the city mentioned in the tool calls to personalize the report header. Default to "YOUR DESTINATION" if not found.
-    city = "YOUR DESTINATION"
-    for message in reversed(state["messages"]):
-
+    # =========================================================================
+    #  Stable logic for determining trip context (replacing the fluctuating Intent and cost)
+    # =========================================================================
+    
+    # 1. Extract destination: First check if there is already a locked city in the State from previous turns
+    city = state.get("current_city") or ""
+    
+    # 2. If no city is saved in the State, extract it from the tool call history
+    if not city or city == "YOUR DESTINATION":
+        city = "YOUR DESTINATION"
+        for message in reversed(state["messages"]):
         # We only care about AI messages that triggered tool calls
-        if not hasattr(message, "tool_calls") or not message.tool_calls:
-            continue
 
-        for tool_call in message.tool_calls:
-            tool_name = tool_call.get("name")
-            tool_args = tool_call.get("args", {})
-
-            if tool_name == "fetch_flights":
-                destination = tool_args.get("destination")
-                if destination:
-                    city = destination
+            if not hasattr(message, "tool_calls") or not message.tool_calls:
+                continue
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.get("name")
+                tool_args = tool_call.get("args", {})
+                if tool_name == "fetch_flights" and tool_args.get("destination"):
+                    city = tool_args.get("destination")
                     break
-
-            if tool_name == "fetch_hotels":
-                hotel_city = tool_args.get("city")
-                if hotel_city:
-                    city = hotel_city
+                if tool_name == "fetch_hotels" and tool_args.get("city"):
+                    city = tool_args.get("city")
                     break
+            if city != "YOUR DESTINATION":
+                break
 
-        if city != "YOUR DESTINATION":
-            break
+    # 3. Define stable anchors (Invariants) to determine if this is a trip context:
+    
+    # Anchor A: We have a verified destination city in the conversation (different from the default)
+    has_verified_city = (city and city != "YOUR DESTINATION")
+    
+    # Anchor B: The model activated one of the core travel tools at least once throughout the conversation history
+    TRAVEL_TOOLS = {"fetch_flights", "find_connecting_flights", "fetch_hotels", "fetch_activities", "calculate_trip_cost"}
+    has_called_travel_tools = any(
+        getattr(m, "name", None) in TRAVEL_TOOLS for m in state["messages"]
+    )
+    
+    # Anchor C (Recommendation): The user set an active budget in the State (saved throughout the session)
+    has_active_budget = state.get("total_budget", 0) > 0
 
+    # If none of the stable anchors are met -> this is pure chit-chat, return clean text only
+    if not has_verified_city and not has_called_travel_tools and not has_active_budget:
+        return {"messages": [AIMessage(content=clean_text)]}
+
+    # =========================================================================
+    #  Build the report (If we reached here, one of the anchors is met and it's a trip)
+    # =========================================================================
     report = f"  TRIP SUMMARY FOR: {city.upper()}\n"
     report += "=" * 40 + "\n\n"
 
@@ -462,14 +508,8 @@ def formatter_node(state: AgentState):
 
     report += clean_text + "\n\n"
     report += "=" * 40 + "\n"
-
+    
     total = state.get("calculated_total", 0)
-    intent = state.get("intent", "general")
-    
-    # Don't show a cost summary for general chit-chat or when no cost data was found
-    if total == 0 and intent == "general":
-        return {}  
-    
     if total > 0:
         report += f" ESTIMATED TOTAL COST: ${total:.2f}\n"
         if state.get("over_budget"):
@@ -483,7 +523,6 @@ def formatter_node(state: AgentState):
     report += "=" * 40
 
     return {"messages": [AIMessage(content=report)], "current_city": city}
-
 # ============================================================================
 # 5. Routing / Conditional Edges
 # ============================================================================
@@ -511,7 +550,7 @@ def check_tool_errors(state: AgentState):
     - 'agent'        otherwise (normal continuation)
     """
     if _extract_no_matches(state):
-        print(f"\n[Router] NO_MATCH signal detected → alternatives_injector")
+        # print(f"\n[Router] NO_MATCH signal detected → alternatives_injector")
         return "alternatives"
 
     # required_tools = {"fetch_flights", "fetch_hotels"}
@@ -614,16 +653,33 @@ def run_agent():
     # Greet returning users and show their stored preferences
     try:
         existing = graph.get_state(config)
-        if existing and existing.values:
+        
+        if not existing or not existing.values:
+            # print(f"[System] Session '{thread_id}' not found. Initializing default state values...")
+            graph.update_state(config, {
+                "current_city": "",
+                "total_budget": 0.0,
+                "calculated_total": 0.0,
+                "over_budget": False,
+                "intent": "general",
+                "missing_data": [],
+                "user_preferences": {},
+                "plan": []
+            })
+            
+        # if existing and existing.values:
+        else:
             prefs = existing.values.get("user_preferences") or {}
             if prefs:
                 print(f"\n[Memory] Welcome back! Loaded preferences for '{thread_id}':")
                 for k, v in prefs.items():
                     print(f"  - {k.replace('_', ' ').title()}: {v}")
                 print()
+            else:
+                print(f"\n[Memory] Welcome back! No stored preferences found for '{thread_id}'.\n")
     except Exception:
-        pass
-
+        print(f"Note during session initialization: {e}")
+    
     print("Hey! Let's fly high. How can I help? (type 'quit' to exit)\n")
 
     while True:
@@ -682,51 +738,61 @@ def run_agent():
             initial_state = {
                 "messages": [HumanMessage(content=user_input)],
                 "step_count": 0,
-                "current_city": "",
-                "total_budget": 0.0,
-                "calculated_total": 0.0,
-                "over_budget": False,
-                "intent": "general",
-                "missing_data": [],
-                "personalization_context": "",
+                # "current_city": "",
+                # "total_budget": 0.0,
+                # "calculated_total": 0.0,
+                # "over_budget": False,
+                # "intent": "general",
+                # "missing_data": [],
+                # "personalization_context": "",
             }
+
 
             print("Searching...\n")
 
-            for event in graph.stream(initial_state, config, stream_mode="values"):
-                # --- DEBUG ---
-                print("\n" + "="*40)
-                print("--- FULL STATE SNAPSHOT ---")
-                
-                # print all the state fields
-                state_data = {k: v for k, v in event.items() if k != "messages"}
-                print(f"Current Metadata: {state_data}")
-                
-                # print the total number of messages in memory
-                print(f"Total messages in memory: {len(event['messages'])}")
-                
-                # print the last message content and type
-                last_msg = event["messages"][-1]
-                print(f"Last Actor: {last_msg.__class__.__name__}")
-                print(f"Last Message Content: {last_msg.content}")
+            # Changing stream_mode to "updates"
+            for chunk in graph.stream(initial_state, config, stream_mode="updates"):
+                if not chunk:
+                    continue
+                for node_name, response in chunk.items():
+                    if response is None:
+                        print(f"[Debug] Node '{node_name}' returned None response, skipping.")
+                        continue
+                    try:
+                        # --- DEBUG FOR UPDATES MODE ---
+                        print("\n" + "="*50)
+                        print(f"--- NODE EXECUTION CHUNK: {node_name} ---")
+                        
+                        # Extract metadata updates excluding messages for clean viewing
+                        node_updates = {k: v for k, v in response.items() if k != "messages"}
+                        print(f"Fields Updated in State: {node_updates}")
+                        
+                        # Check if this specific node added any messages to the graph
+                        if "messages" in response and response["messages"]:
+                            last_node_msg = response["messages"][-1]
+                            print(f"Messages Added by Node: {len(response['messages'])}")
+                            print(f"Last Added Actor: {last_node_msg.__class__.__name__}")
+                            print(f"Last Added Content: {last_node_msg.content}")
+                            
+                        print("="*50 + "\n")
+                        # --- DEBUG FOR UPDATES MODE ---
+                    except Exception as e:
+                        print(f"[Debug Error] Failed to parse chunk for node '{node_name}': {e}")
+                        continue
+                    
+                    # If there is a matching progress message for the completed node - print it
+                    if node_name in PROGRESS_MAP:
+                        print(PROGRESS_MAP[node_name])
+                    
+                    # If we reached the formatter - print the final report directly from its update!
+                    if node_name == "formatter":
+                        print("\n" + "="*40)
+                        # Extract the last AIMessage it generated
+                        final_report = response["messages"][-1].content
+                        print(final_report)
+                        print("="*40 + "\n")
 
-                print("="*40)
-                # --- DEBUG ---
-                last = event["messages"][-1]
-                content = last.content
-                if isinstance(content, list):
-                    content = " ".join(
-                        b.get("text", "") for b in content if b.get("type") == "text"
-                    )
-                if isinstance(content, str) and (
-                    "TRIP SUMMARY" in content or content.strip().startswith("⚠️")
-                ):
-                    print(content)
-
-            # print the final response after streaming completes
-            final_state = graph.get_state(config)
-            last_msg = final_state.values["messages"][-1]
-            print(last_msg.content + "\n")
+            # Note: The print(last_msg.content) that was outside the loop has been removed!
 
         except KeyboardInterrupt:
             print("\nGoodbye — safe travels!")
