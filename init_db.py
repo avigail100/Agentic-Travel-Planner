@@ -7,7 +7,8 @@ def create_travel_db():
     # 1. Drop existing tables if they exist
     tables = [
         "hotels", "flights", "activities", "visa_requirements", 
-        "exchange_rates", "car_rentals", "best_seasons", "time_differences"
+        "exchange_rates", "car_rentals", "best_seasons", "time_differences",
+        "restaurants", "beaches", "public_transport"
     ]
     for table in tables:
         cursor.execute(f"DROP TABLE IF EXISTS {table}")
@@ -105,6 +106,40 @@ def create_travel_db():
         origin TEXT,
         destination TEXT,
         hours_difference INTEGER
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE restaurants (
+        id INTEGER PRIMARY KEY,
+        city TEXT,
+        name TEXT,
+        cuisine TEXT,
+        price_level TEXT,
+        rating REAL,
+        special_features TEXT
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE beaches (
+        id INTEGER PRIMARY KEY,
+        city TEXT,
+        beach_name TEXT,
+        beach_type TEXT,
+        suitable_for TEXT,
+        notes TEXT
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE public_transport (
+        id INTEGER PRIMARY KEY,
+        city TEXT,
+        transport_type TEXT,
+        average_ticket_price REAL,
+        car_needed TEXT,
+        notes TEXT
     )
     """)
 
@@ -363,6 +398,62 @@ def create_travel_db():
     ('Athens', 'Tokyo', 7),
     ]
     cursor.executemany("INSERT INTO time_differences (origin, destination, hours_difference) VALUES (?, ?, ?)", times)
+
+    # --- Restaurants ---
+    restaurants = [
+        ('Paris', 'Le Gourmet', 'French', 'Expensive', 9.3, 'Fine Dining, Romantic'),
+        ('Paris', 'Cafe Montmartre', 'French', 'Moderate', 8.6, 'Local Atmosphere, Breakfast'),
+        ('London', 'The Riverside Grill', 'British', 'Expensive', 9.0, 'River View, Romantic'),
+        ('London', 'Soho Bites', 'International', 'Moderate', 8.4, 'Trendy, Good Nightlife Area'),
+        ('Tokyo', 'Sakura Sushi', 'Japanese', 'Moderate', 9.1, 'Fresh Sushi, Local Experience'),
+        ('Tokyo', 'Shibuya Ramen House', 'Japanese', 'Cheap', 8.7, 'Ramen, Casual'),
+        ('Rome', 'Mama Roma', 'Italian', 'Moderate', 8.8, 'Authentic Pizza, Pasta'),
+        ('Barcelona', 'Tapas Corner', 'Spanish', 'Moderate', 8.6, 'Tapas, Local Food'),
+        ('Bangkok', 'Street Thai', 'Thai', 'Cheap', 8.5, 'Street Food, Local Experience'),
+        ('Dubai', 'Sky Lounge', 'International', 'Luxury', 9.4, 'Rooftop View, Romantic'),
+        ('New York', 'Manhattan Steakhouse', 'American', 'Expensive', 9.0, 'Steakhouse, City View'),
+        ('Miami', 'Ocean Grill', 'Seafood', 'Moderate', 8.7, 'Sea View, Beach Area')
+    ]
+    cursor.executemany("INSERT INTO restaurants (city, name, cuisine, price_level, rating, special_features)VALUES (?, ?, ?, ?, ?, ?)", restaurants)
+
+    # --- Beaches ---
+    beaches = [
+        ('Barcelona', 'Barceloneta Beach', 'Urban Beach', 'Swimming, Nightlife', 'Popular beach close to the city center'),
+        ('Barcelona', 'Bogatell Beach', 'Relaxed Urban Beach', 'Couples, Swimming', 'Quieter than Barceloneta and good for a relaxed beach day'),
+        ('Miami', 'South Beach', 'Party Beach', 'Nightlife, Sunbathing', 'Famous beach with restaurants and nightlife'),
+        ('Miami', 'Crandon Park Beach', 'Family Beach', 'Families, Relaxation', 'Calmer beach option suitable for families'),
+        ('Larnaca', 'Finikoudes Beach', 'Family Beach', 'Families, Swimming', 'Easy beach with promenade and calm atmosphere'),
+        ('Larnaca', 'Mackenzie Beach', 'Lively Beach', 'Swimming, Restaurants', 'Popular beach with cafes and restaurants nearby'),
+        ('Dubai', 'JBR Beach', 'Luxury Beach', 'Families, Water Sports', 'Modern beach area with restaurants nearby'),
+        ('Dubai', 'Kite Beach', 'Sport Beach', 'Water Sports, Families', 'Good for active travelers and beach activities'),
+        ('Athens', 'Vouliagmeni Beach', 'Relaxed Beach', 'Couples, Swimming', 'Good option for a beach escape near Athens'),
+        ('Bangkok', 'Pattaya Beach Day Trip', 'Day Trip Beach', 'Families, Relaxation', 'Beach option outside Bangkok for a day trip'),
+        ('Los Angeles', 'Santa Monica Beach', 'Urban Beach', 'Families, Walking, Sunsets', 'Iconic beach with pier and restaurants'),
+        ('Los Angeles', 'Venice Beach', 'Lively Beach', 'Walking, Street Culture', 'Good for people-watching and a lively atmosphere')
+    ]
+    cursor.executemany("INSERT INTO beaches (city, beach_name, beach_type, suitable_for, notes) VALUES (?, ?, ?, ?, ?)", beaches)
+
+    public_transport = [
+        ('Paris', 'Metro', 2.5, 'No', 'Fast and extensive network'),
+        ('Paris', 'Bus and Metro', 2.2, 'No','Easy to explore tourist areas without a car'),
+        ('London', 'Underground', 3.0, 'No','Public transport is usually easier than driving'),
+        ('London', 'Bus', 1.8, 'No','Good for sightseeing around the city'),
+        ('Tokyo', 'Train', 1.8, 'No','Very punctual and efficient'),
+        ('Tokyo', 'Metro', 1.7, 'No','Best option for most tourist attractions'),
+        ('Bangkok', 'Skytrain', 1.5, 'No','Avoids heavy traffic'),
+        ('Bangkok', 'Taxi', 4.0, 'Sometimes','Cheap but traffic can be very heavy'),
+        ('Dubai', 'Metro', 2.0, 'Sometimes','Metro is modern but taxis are common'),
+        ('Dubai', 'Taxi', 6.0, 'Sometimes','Very common and convenient for tourists'),
+        ('New York', 'Subway', 2.9, 'No','Runs 24/7'),
+        ('New York', 'Taxi', 12.0, 'No','Useful late at night but expensive in traffic'),
+        ('Rome', 'Bus and Metro', 1.7, 'No','Historic center is walkable'),
+        ('Barcelona', 'Metro', 2.4, 'No','Good coverage for tourists'),
+        ('Barcelona', 'Bus', 2.1, 'No','Convenient for beach areas'),
+        ('Los Angeles', 'Car', 0, 'Yes','Renting a car is strongly recommended'),
+        ('Los Angeles', 'Metro', 1.9, 'Sometimes','Limited compared to other major cities'),
+        ('Larnaca', 'Bus and Taxi', 1.5, 'Sometimes','Useful to have a car for beaches outside the center'),
+    ]
+    cursor.executemany("INSERT INTO public_transport (city, transport_type, average_ticket_price, car_needed, notes) VALUES (?, ?, ?, ?, ?)", public_transport)
 
     conn.commit()
     conn.close()

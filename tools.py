@@ -512,3 +512,77 @@ def save_preference(key: str, value: str) -> str:
     value: the preference value (e.g. 'El Al', 'kosher', 'luxury')
     """
     return f"saved:{key}={value}"
+
+@tool
+def fetch_restaurants(city: str):
+    """
+    Fetch recommended restaurants in a city.
+    Use this tool for restaurant, food, cuisine, romantic dinner, cheap food, local food, or fine dining requests.
+    returns a list of restaurants with their cuisine type, price level, rating, and any special features (e.g. vegan options, outdoor seating).
+    """
+
+    query = """
+    SELECT name, cuisine, price_level, rating, special_features
+    FROM restaurants
+    WHERE LOWER(city) = ?
+    """
+
+    params = [city.strip().lower()]
+    matches = _run_query(query, tuple(params))
+
+    if not matches or isinstance(matches, str):
+        return f"No restaurants found in {city}."
+
+    return matches
+
+@tool
+def fetch_beaches(city: str = None):
+    """
+    Fetch beach recommendations.
+    Use this tool for beach, swimming, sunbathing, nightlife near beach, family beach, or water sports requests.
+    If city is not provided, search beaches across all cities.
+    returns a list of beaches with their type (sandy, rocky, pebbly), suitability (family-friendly, good for parties, water sports), and any special notes (e.g. lifeguards on duty, nearby amenities).
+    """
+
+    query = """
+    SELECT city, beach_name, beach_type, suitable_for, notes
+    FROM beaches
+    WHERE 1=1
+    """
+
+    params = []
+
+    if city is not None:
+        query += " AND LOWER(city) = ?"
+        params.append(city.strip().lower())
+
+
+    matches = _run_query(query, tuple(params))
+
+    if not matches or isinstance(matches, str):
+        return "No beach recommendations found."
+
+    return matches
+
+@tool
+def fetch_city_transport_info(city: str):
+    """
+    Get basic city transportation info.
+    Use only for public transport, metro, subway, buses, or getting around a city.
+    Do not use for rental cars.
+    """
+
+    query = """
+    SELECT transport_type, average_ticket_price, car_needed, notes
+    FROM public_transport
+    WHERE LOWER(city) = ?
+    """
+
+    city_param = city.strip().lower()
+
+    matches = _run_query(query, (city_param,))
+
+    if not matches or isinstance(matches, str):
+        return f"No public transport information found for {city}."
+
+    return matches
