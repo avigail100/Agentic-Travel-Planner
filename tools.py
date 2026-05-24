@@ -382,11 +382,10 @@ def fetch_seasonal_recommendations(city: str):
         return f"No seasonal recommendations found for {city}."
     return matches
 
-# TODO: לחדד את עניין הפילטור לפי ים ומזג אוויר וכו
 @tool
 def find_destinations_by_preference(preference: str):
     """
-    Find destinations across all cities based on a weather or season preference.
+    Find destinations across all cities based on a season preference.
     Use this when the user asks where to go based on weather, season,
     climate, or travel timing without specifying a city.
     Examples: warm weather, beach weather, not humid, cherry blossoms, outdoor events
