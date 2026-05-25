@@ -94,7 +94,7 @@ def lookup_location_options(search_term: str, service_type: str):
         "instruction": (
             "Decide: is this semantic equivalence (CASE A) or a genuine mismatch (CASE B)? "
             "CASE A → silently pick the correct item from available_locations and call the target tool immediately. "
-            "CASE B → respond with the exact string 'NO_MATCH:<search_term>'."
+            "CASE B → do not retry, return the exact string:'NO_MATCH:{search_term}'."
         ),
     }
 
@@ -128,6 +128,43 @@ def fetch_flights(origin: str, destination: str = None):
     return matches
 
 @tool
+def find_connecting_flights(origin: str, destination: str):
+    """
+    Search for connecting flights with exactly one stop (layover) from origin to destination.
+    Use this if direct flights (fetch_flights) are not available.
+    Returns a list of flight combinations including the layover city, flight numbers, and total price.
+    """
+    # the qury routes with exactly one layover by joining the flights table twice to find pairs of flights where the destination of the first flight matches the origin of the second flight, 
+    # and the first flight departs from the specified origin while the second flight arrives at the specified destination. 
+    # It returns details about both flights and calculates the total price for the connecting trip.
+    query = """
+    SELECT 
+        f1.origin AS origin, 
+        f1.destination AS layover, 
+        f2.destination AS final_destination,
+        f1.airline AS airline_1, 
+        f1.flight_number AS flight_1, 
+        f1.price AS price_1,
+        f2.airline AS airline_2, 
+        f2.flight_number AS flight_2, 
+        f2.price AS price_2,
+        (f1.price + f2.price) AS total_price
+    FROM flights f1
+    JOIN flights f2 ON LOWER(f1.destination) = LOWER(f2.origin)
+    WHERE LOWER(f1.origin) = ? AND LOWER(f2.destination) = ?
+    """
+    
+    origin_param = origin.strip().lower()
+    dest_param = destination.strip().lower()
+    
+    matches = _run_query(query, (origin_param, dest_param))
+    
+    if not matches or isinstance(matches, str):
+        return f"No connecting flights found with exactly one stop from {origin} to {destination}."
+    
+    return matches
+
+@tool
 def fetch_hotels(city: str, max_price: int = None):
     """
     Find hotels in a specific city from the database.
@@ -147,24 +184,40 @@ def fetch_hotels(city: str, max_price: int = None):
     return matches
 
 @tool
-def calculate_trip_cost(flight_price: float, hotel_price_per_night: float, duration_days: int):
+def calculate_trip_cost(items: list[dict]):
     """
-    Calculates the total cost for a trip including flight and hotel stay.
-    Input: flight_price (float), hotel_price_per_night (float), duration_days (int).
+    Calculates the total grand cost of the trip from a list of dynamic expense items.
+    Use this tool to sum up ALL expenses found during the planning (flights, hotels, activities, car rentals, food, etc.).
+    
+    Input 'items' is a list of dictionaries, where each dictionary MUST contain:
+    - 'name': str (e.g., 'Flight', 'Hotel Stay', 'Louvre Museum')
+    - 'price': float (the cost per unit/night/ticket)
+    - 'quantity': int (optional, defaults to 1. Use for number of nights, tickets, days of car rental, etc.)
     """
     try:
-        total_hotel = float(hotel_price_per_night) * int(duration_days)
-        total_grand = float(flight_price) + total_hotel
+        breakdown = {}
+        total_grand = 0.0
         
+        for item in items:
+            name = item.get("name", "Unknown Expense")
+            price = float(item.get("price", 0.0))
+            quantity = int(item.get("quantity", 1))
+            
+            item_total = price * quantity
+            total_grand += item_total
+            
+            breakdown[name] = {
+                "unit_price": price,
+                "quantity": quantity,
+                "item_total": item_total
+            }
+            
         return {
-            "breakdown": {
-                "flight": flight_price,
-                "hotel_total": total_hotel,
-                "days": duration_days
-            },
+            "breakdown": breakdown,
             "total_estimate": total_grand,
             "currency": "USD"
         }
+    
     except (ValueError, TypeError):
         return "Error: Please provide valid numbers for prices and duration."
 
@@ -217,14 +270,21 @@ def fetch_currency_exchange_rate(origin_currency: str, destination_currency: str
     Returns the exchange rate as of today.
     """
     query = "SELECT exchange_rate FROM exchange_rates WHERE LOWER(origin_currency) = ? AND LOWER(destination_currency) = ?"
+
     origin_param = origin_currency.strip().lower()
     dest_param = destination_currency.strip().lower()
     
-    matches = _run_query(query, (origin_param, dest_param))
+    # First try to find the direct exchange rate
+    res = _run_query(query, (origin_param, dest_param))
     
-    if not matches or isinstance(matches, str):
-        return f"No exchange rate information found for {origin_currency} to {destination_currency}."
-    return matches
+    if res and not isinstance(res, str):
+        return res
+
+    # if no direct exchange rate is found, try to find the reverse exchange rate and invert it
+    res_reverse = _run_query(query, (dest_param, origin_param))
+    if res_reverse and not isinstance(res_reverse, str):
+        original_rate = res_reverse[0]['exchange_rate']
+        return [{"exchange_rate": 1 / original_rate}]
 
 @tool
 def convert_cost_to_origin_currency(cost_in_destination_currency: float, exchange_rate: float):
@@ -304,57 +364,10 @@ def convert_time_to_destination_timezone(time_in_origin_timezone: str, time_diff
     except Exception as e:
         return f"Error converting time: {e}"
 
-
-    
-# if __name__ == "__main__":
-    # origin = "London"
-    # destination = "paris"
-    # flights = fetch_flights.invoke({'origin': origin, 'destination': destination})
-    # print(f"Available flights from {origin} to {destination}:")
-    # print(flights)
-    # city = "Paris"
-    # hotels = fetch_hotels.invoke({'city': city})
-    # print(f"Available hotels in {city} within the budget:")
-    # print(hotels)
-    # flight_price = 150.0
-    # hotel_price_per_night = 100.0
-    # nights = 3
-    # total_cost = calculate_trip_cost.invoke({'flight_price': flight_price, 'hotel_price_per_night': hotel_price_per_night, 'nights': nights})
-    # print(f"Total estimated cost of the trip: ${total_cost:.2f}")
-    # city = "Paris"
-    # activities = fetch_activities.invoke({'city': city, 'budget': 30})
-    # print(f"Available activities in {city} within the budget:")
-    # print(activities)
-    # origin = "Israel"
-    # destination = "France"
-    # visa_info = fetch_visa_requirements.invoke({'origin': origin, 'destination': destination})
-    # print(f"Visa requirements for travelers from {origin} to {destination}:")
-    # print(visa_info)
-    # origin_currency = "USD"
-    # destination_currency = "ILS"
-    # exchange_rate = fetch_currency_exchange_rate.invoke({'origin_currency': origin_currency, 'destination_currency': destination_currency})
-    # print(f"Current exchange rate from {origin_currency} to {destination_currency}:")
-    # print(exchange_rate)
-    # cost_in_destination_currency = 100.0
-    # exchange_rate = 3.65
-    # converted_cost = convert_cost_to_origin_currency.invoke({'cost_in_destination_currency': cost_in_destination_currency, 'exchange_rate': exchange_rate})
-    # print(f"Cost in origin currency: {converted_cost:.2f}")
-    # city = "Paris"
-    # car_rental_agencies = fetch_car_rental_agencies.invoke({'city': city})
-    # print(f"Available car rental agencies in {city}:")
-    # print(car_rental_agencies)
-    # city = "Paris"
-    # seasonal_recommendations = fetch_seasonal_recommendations.invoke({'city': city})
-    # print(f"Seasonal travel recommendations for {city}:")
-    # print(seasonal_recommendations)
-    # city = "Paris"
-    # time_difference = fetch_time_difference.invoke({'origin': "Tel Aviv", 'destination': city})
-    # print(f"Time difference between Tel Aviv and {city}:")
-    # print(time_difference)
-    # time_in_origin_timezone = "2024-07-01 12:00"
-    # converted_time = convert_time_to_destination_timezone.invoke({'time_in_origin_timezone': time_in_origin_timezone, 'time_difference_hours': time_difference[0]['hours_difference']})
-    # print(f"Time in {city} when it's {time_in_origin_timezone} in Tel Aviv: {converted_time}")
-
-    #סוכנויות רכב בשדה
-    # עונה מומלצת
-    # המרת שעות
+@tool
+def save_preference(key: str, value: str) -> str:
+    """Save a user travel preference for future sessions.
+    key: one of preferred_airline, food_preference, travel_style, seat_preference, class_preference
+    value: the preference value (e.g. 'El Al', 'kosher', 'luxury')
+    """
+    return f"saved:{key}={value}"
