@@ -109,6 +109,7 @@ class PlanExecuteState(TypedDict):
     calculated_total: float
     over_budget: bool     # user preferences
     user_preferences: dict
+    chat_history: str
 
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
@@ -144,7 +145,6 @@ def _summarise_tool_messages(messages: list) -> str:
             parts.append(f"[{m.name}] → {content}")
     return "\n".join(parts) if parts else "(no tool output)"
 
-
 def _no_match_detected(messages: list) -> bool:
     """
     True only on CASE B — a genuine mismatch where the executor explicitly
@@ -162,7 +162,6 @@ def _no_match_detected(messages: list) -> bool:
             if isinstance(m.content, str) and m.content.strip().startswith("NO_MATCH:"):
                 return True
     return False
-
 
 def _extract_cost(messages: list) -> float:
     total = 0.0
@@ -197,26 +196,50 @@ Rules:
 def plan_node(state: PlanExecuteState):
     budget = _extract_budget(state["input"])
     
-    # Extract and format past messages to give the Planner context/memory across turns
+    # -------------------------------------------------------------------------
+    # MEMORY INJECTION: Read from chat_history instead of messages
+    # -------------------------------------------------------------------------
     history_context = ""
-    if state.get("messages"):
-        history_context = "Past conversation context:\n"
-        for msg in state["messages"]:
-            actor = "User" if msg.__class__.__name__ == "HumanMessage" else "Agent"
-            # Handle both string and list content types safely
-            content = msg.content
-            if isinstance(content, list):
-                content = " ".join([b.get("text", "") for b in content if b.get("type") == "text"])
-            history_context += f"  {actor}: {content}\n"
-            
-    # Inject both the historical context and the fresh user input into the prompt
+    if state.get("chat_history"):
+        history_context = f"Past conversation context:\n{state['chat_history']}"
+    # Inject both the historical context and the fresh user input into the prompt    
     prompt = (
         f"{PLANNER_SYSTEM}\n\n"
         f"{history_context}\n"
         f"New User Request: {state['input']}"
     )
     
-    plan = planner_model.invoke(prompt)
+    # # Extract and format past messages to give the Planner context/memory across turns
+    # history_context = ""
+    # if state.get("messages"):
+    #     history_context = "Past conversation context:\n"
+    #     for msg in state["messages"]:
+    #         actor = "User" if msg.__class__.__name__ == "HumanMessage" else "Agent"
+    #         # Handle both string and list content types safely
+    #         content = msg.content
+    #         if isinstance(content, list):
+    #             content = " ".join([b.get("text", "") for b in content if b.get("type") == "text"])
+    #         history_context += f"  {actor}: {content}\n"
+            
+    # # Inject both the historical context and the fresh user input into the prompt
+    # prompt = (
+    #     f"{PLANNER_SYSTEM}\n\n"
+    #     f"{history_context}\n"
+    #     f"New User Request: {state['input']}"
+    # )
+     
+
+    try:
+        plan = planner_model.invoke(prompt)
+    except Exception as e:
+        err_text = _is_api_error(e) or f"[ERROR] Planner failed: {e}"
+        print(f"\n[Planner] {err_text}")
+        return {
+            "messages": [AIMessage(content=err_text)],
+            "plan": [],
+            "response": err_text,
+        }
+
 
     # Deduplicate while preserving order
     seen: set = set()
@@ -346,7 +369,7 @@ def execute_node(state: PlanExecuteState):
                 # If the exact same tool with the exact same arguments was called before:
                 if current_call in past_tool_calls:
                     loop_error = f"[ERROR] Infinite loop detected. The tool '{tc.get('name')}' was called again with the exact same arguments: {args_str}."
-                    print(f"\n[Loop Guard] Aborting execution to prevent API quota drain.")
+                    print(f"\n[Loop Guard] Aborting execution to prevent API quota drain.\n {loop_error}")
                     
                     return {
                         "messages": [AIMessage(content=loop_error)],
@@ -505,26 +528,33 @@ def replan_node(state: PlanExecuteState):
     total_cost = state.get("calculated_total", 0.0)
 
     # -------------------------------------------------------------------------
-    # Build conversation memory context for the Replanner
+    # FAST-TRACK ERROR HANDLING:
+    # If the Executor already caught an API error, bypass the Replanner entirely.
+    # Do not try to summarize, just pass the error directly to the Formatter.
+    # -------------------------------------------------------------------------
+    if state.get("response", "").startswith("[ERROR]"):
+        print("\n[Replanner] ⚠️  Detected upstream execution error. Bypassing LLM summary.")
+        return {
+            "plan": [],
+            # Keep the existing error response intact
+        }
+
+    # -------------------------------------------------------------------------
+    # CLEAN MEMORY INJECTION: Read from chat_history instead of messages
     # -------------------------------------------------------------------------
     history_context = ""
-    if state.get("messages"):
-        history_context = "Past conversation context:\n"
-        for msg in state["messages"]:
-            actor = "User" if msg.__class__.__name__ == "HumanMessage" else "Agent"
-            content = msg.content
-            if isinstance(content, list):
-                content = " ".join([b.get("text", "") for b in content if b.get("type") == "text"])
-            # Keep context concise to save tokens
-            history_context += f"  {actor}: {content[:300]}\n"
-
-    # Safety: force a final answer if we've re-planned too many times
+    if state.get("chat_history"):
+        history_context = f"Past conversation context:\n{state['chat_history']}"
+        
+    # Safety: force a final answer if we've re-planned too many times or plan is empty
     if replan_count > MAX_REPLAN_CYCLES or not state["plan"]:
         force_final = replan_count > MAX_REPLAN_CYCLES
+        
         if force_final:
             print(f"\n[Replanner] ⚠️  Replan limit ({MAX_REPLAN_CYCLES}) reached — forcing final answer.")
         else:
             print("\n[Replanner] ✅ All planned steps completed successfully. Generating final response.")
+
         past_steps_text = "\n".join(state.get("past_steps", [])) or "(none)"
         budget_note = (
             f"\nBudget provided: ${budget:.2f}. Estimated total: ${total_cost:.2f}."
@@ -541,13 +571,32 @@ def replan_node(state: PlanExecuteState):
             "No raw DB output — narrate the findings clearly."
             "If suggesting alternatives, explicitly mention the options found via tools."
         )
-        final_msg = _base_model.invoke(final_prompt)
+        
+        # -------------------------------------------------------------------------
+        # BULLETPROOF SUMMARY GENERATION:
+        # Wrap the final LLM call in try/except. If the API fails now, use plain Python
+        # to stitch together a raw fallback summary without relying on the model.
+        # -------------------------------------------------------------------------
+        try:
+            final_msg = _base_model.invoke(final_prompt)
+            final_text = final_msg.content
+        except Exception as e:
+            err_text = _is_api_error(e) or f"[ERROR] API failed during final summary: {e}"
+            print(f"\n[Replanner] {err_text}")
+            
+            # Python-only fallback summary
+            final_text = (
+                "⚠️ I apologize, but I reached my API limits before I could write a nice summary for you. "
+                "However, here is the raw data I managed to collect so far:\n\n"
+                f"{past_steps_text}\n"
+            )
+
         return {
-            "response": final_msg.content,
+            "response": final_text,
             "plan": [],
             "replan_count": replan_count,
         }
-
+            
     past_steps_text = "\n".join(state.get("past_steps", [])) or "(none)"
     remaining_text = "\n".join(f"  - {s}" for s in state["plan"])
     budget_note = (
@@ -572,7 +621,7 @@ def replan_node(state: PlanExecuteState):
         print(f"\n[Replanner] {err_text}")
         return {"response": err_text, "plan": [], "replan_count": replan_count}
 
-    print(f"\n[Replanner] Decision: {type(result.action)}")
+    print(f"\n[Replanner] Decision: {type(result.action).__name__}")
 
     if isinstance(result.action, FinalResponse):
         budget_warn = ""
@@ -600,7 +649,6 @@ def replan_node(state: PlanExecuteState):
         "plan": new_steps,
         "replan_count": replan_count,
     }
-
 
 # ---------------------------------------------------------------------------
 # Routing after replan
@@ -659,8 +707,18 @@ def formatter_node(state: PlanExecuteState):
     print("\n" + "=" * 40)
     print(report)
     print("=" * 40 + "\n")
+    
+    # -------------------------------------------------------------------------
+    # MEMORY UPDATE: Append the current interaction to the chat history
+    # -------------------------------------------------------------------------
+    current_history = state.get("chat_history", "")
+    new_history = current_history + f"User: {state['input']}\nAgent: {raw.strip()}\n\n"
 
-    return {"response": report}
+    return {
+        "response": report, 
+        "chat_history": new_history  # Save to DB via SqliteSaver
+    }
+
 
 
 # ---------------------------------------------------------------------------
