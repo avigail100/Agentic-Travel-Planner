@@ -165,6 +165,25 @@ def find_connecting_flights(origin: str, destination: str):
     return matches
 
 @tool
+def suggest_alternatives(origin: str):
+    """
+    Find available alternative flight destinations from a specific origin city.
+    Use this ONLY when the originally requested destination is unreachable (direct or connection flights) or flights are unavailable.
+    Input: The origin city (e.g., 'Tel Aviv', 'London').
+    """
+    query = "SELECT DISTINCT destination FROM flights WHERE LOWER(origin) = ?"
+    origin_param = origin.strip().lower()
+    
+    matches = _run_query(query, (origin_param,))
+    
+    if not matches or isinstance(matches, str):
+        return f"No alternative flight destinations found departing from {origin}."
+    
+    # Extract just the destination names into a clean list
+    destinations = [row["destination"] for row in matches if "destination" in row]
+    return f"Available destinations from {origin}: {', '.join(destinations)}"
+
+@tool
 def fetch_hotels(city: str, max_price: int = None):
     """
     Find hotels in a specific city from the database.

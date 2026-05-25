@@ -48,6 +48,7 @@ from tools import (
     find_connecting_flights,
     lookup_location_options,
     save_preference,
+    suggest_alternatives
 )
 
 load_dotenv()
@@ -115,7 +116,8 @@ tools = [
     calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
     fetch_seasonal_recommendations, convert_time_to_destination_timezone,
-    lookup_location_options, find_connecting_flights, save_preference,
+    lookup_location_options, find_connecting_flights,
+    save_preference, suggest_alternatives
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
@@ -194,7 +196,26 @@ Rules:
 
 def plan_node(state: PlanExecuteState):
     budget = _extract_budget(state["input"])
-    prompt = f"{PLANNER_SYSTEM}\n\nUser request: {state['input']}"
+    
+    # Extract and format past messages to give the Planner context/memory across turns
+    history_context = ""
+    if state.get("messages"):
+        history_context = "Past conversation context:\n"
+        for msg in state["messages"]:
+            actor = "User" if msg.__class__.__name__ == "HumanMessage" else "Agent"
+            # Handle both string and list content types safely
+            content = msg.content
+            if isinstance(content, list):
+                content = " ".join([b.get("text", "") for b in content if b.get("type") == "text"])
+            history_context += f"  {actor}: {content}\n"
+            
+    # Inject both the historical context and the fresh user input into the prompt
+    prompt = (
+        f"{PLANNER_SYSTEM}\n\n"
+        f"{history_context}\n"
+        f"New User Request: {state['input']}"
+    )
+    
     plan = planner_model.invoke(prompt)
 
     # Deduplicate while preserving order
@@ -219,11 +240,21 @@ def plan_node(state: PlanExecuteState):
         "executor_steps": 0,
         "replan_count": 0,
         "total_budget": budget or state.get("total_budget", 0.0),
-        "calculated_total": 0.0,
-        "over_budget": False,
-        "messages": [],
+        "calculated_total": state.get("calculated_total", 0.0),
+        "over_budget": state.get("over_budget", False),
+        "messages": state.get("messages", []), # Maintain message flow
     }
-
+    #     return {
+    #     "plan": unique_steps,
+    #     "past_steps": [],
+    #     "response": "",
+    #     "executor_steps": 0,
+    #     "replan_count": 0,
+    #     "total_budget": budget or state.get("total_budget", 0.0),
+    #     "calculated_total": 0.0,
+    #     "over_budget": False,
+    #     "messages": [],
+    # }
 
 # ---------------------------------------------------------------------------
 # Node: executor
@@ -265,6 +296,20 @@ def execute_node(state: PlanExecuteState):
         return {}
 
     current_step = state["plan"][0]
+    
+    # -------------------------------------------------------------------------
+    #  GATHER PAST TOOL CALLS FOR EXACT MATCHING
+    # -------------------------------------------------------------------------
+    # Build a set of tuples: (tool_name, stringified_sorted_args)
+    past_tool_calls = set()
+    for msg in state.get("messages", []):
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                # json.dumps with sort_keys ensures {a:1, b:2} == {b:2, a:1}
+                args_str = json.dumps(tc.get("args", {}), sort_keys=True)
+                past_tool_calls.add((tc.get("name"), args_str))
+    # -------------------------------------------------------------------------
+
     prefs = state.get("user_preferences") or {}
     pref_block = (
         "User preferences: " + ", ".join(f"{k}={v}" for k, v in prefs.items())
@@ -282,19 +327,40 @@ def execute_node(state: PlanExecuteState):
         f"Original goal: {state['input']}\n\n"
         f"{history_block}\n\n"
         f"{'[Preferences] ' + pref_block if pref_block else ''}\n\n"
-        f"Current step: {current_step}"
+        f"Current step: {current_step}\n"
     )
 
     print(f"\n[Executor] Running step: {current_step}")
 
     try:
         response = executor_model.invoke([HumanMessage(content=input_text)])
+        
+        # -------------------------------------------------------------------------
+        #  INFINITE LOOP GUARD: Check if the model generated an identical tool call
+        # -------------------------------------------------------------------------
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            for tc in response.tool_calls:
+                args_str = json.dumps(tc.get("args", {}), sort_keys=True)
+                current_call = (tc.get("name"), args_str)
+                
+                # If the exact same tool with the exact same arguments was called before:
+                if current_call in past_tool_calls:
+                    loop_error = f"[ERROR] Infinite loop detected. The tool '{tc.get('name')}' was called again with the exact same arguments: {args_str}."
+                    print(f"\n[Loop Guard] Aborting execution to prevent API quota drain.")
+                    
+                    return {
+                        "messages": [AIMessage(content=loop_error)],
+                        "plan": [],   # Clear the plan to force Replanner to handle the failure
+                        "response": "I encountered an issue searching for this specific combination repeatedly. Please try adjusting your destination or origin specifications.",
+                    }
+        # -------------------------------------------------------------------------
+        
     except Exception as e:
         err_text = _is_api_error(e) or f"[ERROR] Executor failed: {e}"
         print(f"\n[Executor] {err_text}")
         return {
             "messages": [AIMessage(content=err_text)],
-            "plan": [],   # abort remaining steps
+            "plan": [],
             "response": err_text,
         }
 
@@ -302,8 +368,6 @@ def execute_node(state: PlanExecuteState):
         "messages": [HumanMessage(content=f"[Step] {current_step}"), response],
         "executor_steps": state.get("executor_steps", 0) + 1,
     }
-
-
 # ---------------------------------------------------------------------------
 # Routing after executor
 # ---------------------------------------------------------------------------
@@ -345,6 +409,15 @@ def after_tools(state: PlanExecuteState):
         "calculated_total": total_cost,
         "user_preferences": existing_prefs,
     }
+
+# ---------------------------------------------------------------------------
+# Routing after executor
+# ---------------------------------------------------------------------------
+
+def route_after_tools(state: PlanExecuteState) -> str:
+    if _no_match_detected(state["messages"]):
+        return "no_match"
+    return "execute" if state.get("plan") else "replan"
 
 
 # ---------------------------------------------------------------------------
@@ -390,35 +463,69 @@ def no_match_injector_node(state: PlanExecuteState) -> dict:
 # Node: replan
 # ---------------------------------------------------------------------------
 
+# REPLANNER_SYSTEM = """You are a travel planning supervisor reviewing execution progress.
+
+# Decide between two actions:
+# A) FinalResponse: ONLY use this if ALL information goals (flights, hotels, etc.) were successfully 
+#    retrieved and you have data to build a complete plan, OR if the database definitively confirms 
+#    that no options exist and no further alternatives can be checked. Never dump raw rows — narrate.
+# B) Plan: Use this if steps remain OR if a previous step failed/returned no results (e.g., 'No flights found'). 
+#    If a flight lookup fails, YOUR REVISED PLAN MUST PROACTIVELY INCLUDE A STEP TO FIND ALTERNATIVES 
+#    (like checking connecting flights via find_connecting_flights or suggesting alternative nearby destinations).
+
+# Rules for revising plans:
+# - Do NOT re-add a step that already appears in the completed history with the exact same target parameters.
+# - If a step failed, adapt the plan dynamically. Do not emit an empty plan or repeat the failing step blindly.
+# - CRITICAL: If the history contains a SYSTEM NOTE listing available destinations, you MUST only suggest 
+#   destinations from that exact list. Never invent or hallucinate unlisted destinations.
+# - If budget was provided and the total cost exceeds it, mention this clearly.
+# """
+
+
 REPLANNER_SYSTEM = """You are a travel planning supervisor reviewing execution progress.
 
-Decide:
-A) If all steps are done AND you have enough data → output a FinalResponse with
-   a clear, friendly, well-formatted travel summary. Never dump raw DB rows — narrate.
-B) If steps remain OR results were unexpected → output a revised Plan with the
-   remaining steps (no repeats of already-completed work).
+Decide between two actions:
+A) FinalResponse: Use this if all goals are met, OR if the database definitively confirms no options exist and no valid alternatives can be offered.
+B) Plan: Use this to revise the plan if steps remain, or if a previous step failed.
 
-Rules:
+Rules for revising plans:
+1. NO FORCED FLIGHTS: Do not add flight searches for domestic/local trips.
+2. FLIGHT FAILURES: If a requested flight search fails, add a step to use 'find_connecting_flights'.
+3. SMART ALTERNATIVES: If connecting flights also fail, or if a destination is totally unreachable, 
+add a step to use the 'suggest_alternatives' tool with the user's origin city to find real, valid destinations.
+4. DO NOT repeat a failed step with the exact same parameters.
 - Do NOT re-add a step that already appears in the completed history.
-- CRITICAL: If the history contains a SYSTEM NOTE listing available destinations,
-  you MUST only suggest destinations from that exact list. Never invent or hallucinate
-  destination names that are not explicitly listed there.
-- If budget was provided and the total cost exceeds it, mention this clearly.
+5. MEMORY: Consider the user's past conversation history (provided below) to tailor your alternative suggestions to their preferences (explicit/not).
+6. If budget was provided and the total cost exceeds it, mention this clearly.
 """
-
 
 def replan_node(state: PlanExecuteState):
     replan_count = state.get("replan_count", 0) + 1
     budget = state.get("total_budget", 0.0)
     total_cost = state.get("calculated_total", 0.0)
 
+    # -------------------------------------------------------------------------
+    # Build conversation memory context for the Replanner
+    # -------------------------------------------------------------------------
+    history_context = ""
+    if state.get("messages"):
+        history_context = "Past conversation context:\n"
+        for msg in state["messages"]:
+            actor = "User" if msg.__class__.__name__ == "HumanMessage" else "Agent"
+            content = msg.content
+            if isinstance(content, list):
+                content = " ".join([b.get("text", "") for b in content if b.get("type") == "text"])
+            # Keep context concise to save tokens
+            history_context += f"  {actor}: {content[:300]}\n"
+
     # Safety: force a final answer if we've re-planned too many times
     if replan_count > MAX_REPLAN_CYCLES or not state["plan"]:
         force_final = replan_count > MAX_REPLAN_CYCLES
         if force_final:
             print(f"\n[Replanner] ⚠️  Replan limit ({MAX_REPLAN_CYCLES}) reached — forcing final answer.")
-
-        history_text = "\n".join(state.get("past_steps", [])) or "(none)"
+        else:
+            print("\n[Replanner] ✅ All planned steps completed successfully. Generating final response.")
+        past_steps_text = "\n".join(state.get("past_steps", [])) or "(none)"
         budget_note = (
             f"\nBudget provided: ${budget:.2f}. Estimated total: ${total_cost:.2f}."
             + (" NOTE: OVER BUDGET." if budget > 0 and total_cost > budget else "")
@@ -427,10 +534,12 @@ def replan_node(state: PlanExecuteState):
 
         final_prompt = (
             f"The user asked: {state['input']}\n\n"
-            f"Completed steps:\n{history_text}\n"
+            f"{history_context}\n\n"
+            f"Completed steps:\n{past_steps_text}\n"
             f"{budget_note}\n\n"
             "Produce a friendly, well-formatted final travel summary. "
             "No raw DB output — narrate the findings clearly."
+            "If suggesting alternatives, explicitly mention the options found via tools."
         )
         final_msg = _base_model.invoke(final_prompt)
         return {
@@ -439,7 +548,7 @@ def replan_node(state: PlanExecuteState):
             "replan_count": replan_count,
         }
 
-    history_text = "\n".join(state.get("past_steps", [])) or "(none)"
+    past_steps_text = "\n".join(state.get("past_steps", [])) or "(none)"
     remaining_text = "\n".join(f"  - {s}" for s in state["plan"])
     budget_note = (
         f"Budget: ${budget:.2f}. Running total so far: ${total_cost:.2f}."
@@ -448,8 +557,9 @@ def replan_node(state: PlanExecuteState):
 
     prompt = (
         f"{REPLANNER_SYSTEM}\n\n"
+        f"{history_context}\n\n"
         f"Original goal: {state['input']}\n\n"
-        f"Completed steps:\n{history_text}\n\n"
+        f"Completed steps:\n{past_steps_text}\n\n"
         f"Remaining planned steps:\n{remaining_text}\n\n"
         f"{budget_note}\n\n"
         "What should happen next?"
@@ -462,7 +572,7 @@ def replan_node(state: PlanExecuteState):
         print(f"\n[Replanner] {err_text}")
         return {"response": err_text, "plan": [], "replan_count": replan_count}
 
-    print(f"\n[Replanner] Decision: {type(result.action).__name__}")
+    print(f"\n[Replanner] Decision: {type(result.action)}")
 
     if isinstance(result.action, FinalResponse):
         budget_warn = ""
@@ -578,11 +688,6 @@ builder.add_conditional_edges(
 builder.add_edge("tools",             "after_tools_node")
 builder.add_edge("no_match_injector", "replan")
 
-def route_after_tools(state: PlanExecuteState) -> str:
-    if _no_match_detected(state["messages"]):
-        return "no_match"
-    return "execute" if state.get("plan") else "replan"
-
 builder.add_conditional_edges(
     "after_tools_node", route_after_tools,
     {"execute": "execute", "replan": "replan", "no_match": "no_match_injector"},
@@ -613,7 +718,7 @@ PROGRESS_MAP = {
     "after_tools_node":  "📊  Processing tool results...",
     "no_match_injector": "💡  Destination not found — searching for alternatives...",
     "replan":            "🔄  Reviewing progress and re-evaluating plan...",
-    "formatter":         "✨  Formatting final report...",
+    # "formatter":         "✨  Formatting final report...",
 }
 
 
