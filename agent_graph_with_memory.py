@@ -27,12 +27,14 @@ import os
 from langchain_groq import ChatGroq
 
 from tools import (
-    fetch_flights, fetch_hotels, fetch_activities,
+    fetch_flights, fetch_hotels, find_hotels_by_amenity, fetch_activities,
     fetch_visa_requirements, fetch_time_difference,
     calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
-    fetch_seasonal_recommendations, convert_time_to_destination_timezone,
+    fetch_seasonal_recommendations, find_destinations_by_preference, convert_time_to_destination_timezone,
     lookup_location_options, find_connecting_flights, save_preference,
+    fetch_restaurants, fetch_beaches, fetch_city_transport_info
+
 )
 
 load_dotenv()
@@ -47,6 +49,8 @@ SYSTEM_PROMPT = """You are a proactive travel planning assistant. Use the availa
 Rules:
 - CHIT-CHAT & INTRODUCTIONS: If the user is just greeting, introducing themselves, or making small talk, 
   YOU MUST NOT CALL ANY TOOLS. Just say hello, use their name, acknowledge their location, and ask how you can help them plan a trip.
+ANY request mentioning a place, food, activity, transport, or travel info 
+  MUST call the relevant tool — even if it seems casual.
 - TRIP PLANNING: ONLY when the user explicitly asks to travel, book, or search for travel information, you should call tools.
 - When you DO plan a trip, the very first tool you call MUST be lookup_location_options to verify the destination, 
   and use the verified location for the subsequent tools immediately and explain the substitution.
@@ -113,18 +117,19 @@ class AgentState(TypedDict):
 # ============================================================================
 
 tools = [
-    fetch_flights, fetch_hotels, fetch_activities,
+    fetch_flights, fetch_hotels,find_hotels_by_amenity, fetch_activities,
     fetch_visa_requirements, fetch_time_difference,
     calculate_trip_cost, fetch_currency_exchange_rate,
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
-    fetch_seasonal_recommendations, convert_time_to_destination_timezone,
-    lookup_location_options, find_connecting_flights,
-    save_preference, 
+    fetch_seasonal_recommendations, find_destinations_by_preference, convert_time_to_destination_timezone,
+    lookup_location_options, find_connecting_flights, save_preference,
+    fetch_restaurants, fetch_beaches, fetch_city_transport_info
 ]
 
 model = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash", temperature=0, max_retries=2
 ).bind_tools(tools)
+
 
 # model = ChatGroq(
 #   api_key=os.getenv("GROQ_API_KEY"),
