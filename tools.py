@@ -405,6 +405,151 @@ def convert_time_to_destination_timezone(time_in_origin_timezone: str, time_diff
     except Exception as e:
         return f"Error converting time: {e}"
 
+# Trusted source allowlists per category. The LLM chooses the category (it
+# understands the user's intent); the tool then biases Tavily toward these hosts
+# via include_domains AND hard-enforces them in code, so results only come from
+# reputable sources. "events" is open web — there's no single canonical source.
+_WEB_SOURCES = {
+    "news":     ["bbc.com", "reuters.com", "apnews.com"],
+    "exchange": ["xe.com", "x-rates.com"],
+    "weather":  ["weather.com", "accuweather.com"],
+    "events":   ["reuters.com"],
+}
+
+
+def _host_on_allowlist(result: dict, hosts: list) -> bool:
+    """True only if a search result's URL is https AND its hostname is on the
+    allowlist. Matches the parsed hostname (or a subdomain of it), never a loose
+    substring, so spoofs like https://evil.com/bbc.com are rejected."""
+    from urllib.parse import urlparse
+
+    url = (result.get("href") or result.get("url") or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+    netloc = parsed.netloc.lower().split(":")[0]  # drop any :port
+    return any(netloc == h or netloc.endswith("." + h) for h in hosts)
+
+
+@tool
+def search_web(query: str, category: str) -> str:
+    """
+    Search the live internet for real-world, time-sensitive travel information that is
+    NOT stored in our database.
+
+    USE THIS TOOL ONLY FOR: current currency/exchange rates, weather and forecasts,
+    local news, public safety advisories, strikes/closures, holidays, festivals, and
+    special events at a destination.
+
+    DO NOT use this tool for flights, hotels, activities, car rentals, or
+    time differences — those come exclusively from the database tools (the single
+    source of truth). Never use this tool to invent prices for bookable items.
+
+    YOU must choose the correct `category` based on what the user is asking about.
+    Each category restricts results to its trusted sources:
+      - "exchange" → currency / exchange-rate questions (xe.com, x-rates.com)
+      - "weather"  → weather & forecasts (weather.com, accuweather.com)
+      - "news"     → news, safety advisories, strikes, closures (bbc.com, reuters.com, apnews.com)
+      - "events"   → festivals, holidays, concerts, special events (general trusted web)
+
+    Input:
+    - query: a focused natural-language query, e.g. "current USD to EUR exchange rate"
+             or "weather in Tokyo late May 2026" or "special events in Paris June 2026".
+    - category: one of "exchange", "weather", "news", "events".
+    Returns: a synthesized direct answer (when available) plus the supporting
+             trusted-source snippets, or a message indicating no results were found.
+    """
+    cleaned = query.strip()
+    if not cleaned:
+        return "No search query provided."
+
+    cat = category.strip().lower()
+    if cat not in _WEB_SOURCES:
+        return (
+            f"Invalid category '{category}'. "
+            f"Choose one of: {list(_WEB_SOURCES.keys())}."
+        )
+
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return (
+            "Error: web search is unavailable — TAVILY_API_KEY is not set. "
+            "Add it to your .env file."
+        )
+
+    import requests
+
+    hosts = _WEB_SOURCES[cat]
+    # Tavily's news topic returns recent, dated articles — ideal for advisories,
+    # strikes, and closures. Everything else uses the general topic.
+    topic = "news" if cat == "news" else "general"
+
+    payload = {
+        "query": cleaned,
+        "search_depth": "basic",
+        "topic": topic,
+        "include_answer": True,   # Tavily synthesizes a direct answer (e.g. the actual rate/temp)
+        "max_results": 8,
+    }
+    if hosts:
+        # Bias Tavily toward the trusted hosts; we still hard-enforce below.
+        payload["include_domains"] = hosts
+    if topic == "news":
+        payload["days"] = 14   # only recent news
+
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError:
+        code = resp.status_code
+        if code in (401, 403):
+            return "Web search failed: Tavily rejected the API key (check TAVILY_API_KEY)."
+        if code == 429:
+            return "Web search failed: Tavily rate limit / quota exceeded. Try again later."
+        return f"Web search failed: Tavily returned HTTP {code}."
+    except Exception as e:
+        return f"Web search failed: {e}"
+
+    results = data.get("results") or []
+
+    # HARD-enforce the allowlist so no off-list host can leak through. Match on
+    # the parsed hostname (not a loose substring) and require https, so a spoofed
+    # URL like https://evil.com/bbc.com or any http:// result can't slip past.
+    if hosts:
+        results = [r for r in results if _host_on_allowlist(r, hosts)]
+
+    answer = (data.get("answer") or "").strip()
+    results = results[:5]
+
+    if not answer and not results:
+        if hosts:
+            return (
+                f"No results from trusted {cat} sources ({', '.join(hosts)}) "
+                f"for: {cleaned}."
+            )
+        return f"No web results found for: {cleaned} (category: {cat})."
+
+    lines = [f"Web search results for '{cleaned}' [category: {cat}]:"]
+    if answer:
+        lines.append(f"ANSWER: {answer}")
+    for i, r in enumerate(results, 1):
+        title = (r.get("title") or "").strip()
+        content = (r.get("content") or "").strip()
+        if len(content) > 400:
+            content = content[:400] + "…"
+        url = r.get("url") or r.get("href") or ""
+        date = (r.get("published_date") or "").strip()
+        date_str = f" ({date[:10]})" if date else ""
+        lines.append(f"{i}. {title}{date_str}\n   {content}\n   Source: {url}")
+    return "\n".join(lines)
+
+
 @tool
 def save_preference(key: str, value: str) -> str:
     """Save a user travel preference for future sessions.

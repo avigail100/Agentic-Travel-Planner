@@ -50,6 +50,7 @@ from tools import (
     find_connecting_flights,
     lookup_location_options,
     save_preference,
+    search_web,
     suggest_alternatives
 )
 
@@ -120,7 +121,7 @@ tools = [
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
     fetch_seasonal_recommendations, convert_time_to_destination_timezone,
     lookup_location_options, find_connecting_flights,
-    save_preference, suggest_alternatives
+    save_preference, suggest_alternatives, search_web
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
@@ -158,6 +159,46 @@ def _summarise_tool_messages(messages: list) -> str:
                 content = content[:600] + "…[truncated]"
             parts.append(f"[{m.name}] → {content}")
     return "\n".join(parts) if parts else "(no tool output)"
+
+def _digest_tool_result(content) -> str:
+    """One short, human-readable line summarising a single tool result for the
+    console trace (not the full raw dump)."""
+    # Parse JSON content where possible so we can count rows / pick key fields.
+    data = content
+    if isinstance(content, str):
+        try:
+            data = json.loads(content)
+        except Exception:
+            data = content
+
+    if data is None:
+        return "no result"
+    if isinstance(data, list):
+        return f"{len(data)} result(s)" if data else "no results"
+    if isinstance(data, dict):
+        if data.get("no_direct_match"):
+            opts = data.get("available_locations", [])
+            return f"no direct match — options: {', '.join(map(str, opts))}"
+        if "answer" in data:   # (not expected here, but be safe)
+            return str(data["answer"])[:120]
+        return ", ".join(f"{k}={v}" for k, v in list(data.items())[:3])[:120]
+
+    text = str(data).strip()
+    # search_web returns a multi-line block; the ANSWER line is the useful part.
+    for line in text.splitlines():
+        if line.startswith("ANSWER:"):
+            text = line[len("ANSWER:"):].strip()
+            break
+    else:
+        text = text.replace("\n", " ")
+    return (text[:120] + "…") if len(text) > 120 else text
+
+def _format_call(tc: dict) -> str:
+    """Render a tool call as 'tool(key=val, …)' with compact args."""
+    name = tc.get("name", "?")
+    args = tc.get("args", {}) or {}
+    shown = ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
+    return f"{name}({shown})" if shown else f"{name}()"
 
 def _no_match_detected(messages: list) -> bool:
     """
@@ -200,9 +241,19 @@ Your goal is to break down the user's travel request into a logical, efficient s
 AVAILABLE TOOLS:
 {tool_descriptions}
 
+SOURCE-OF-TRUTH BOUNDARY (read carefully):
+- The DATABASE is the single source of truth for flights, hotels,
+  activities, car rentals, and time differences. ALWAYS use the
+  dedicated DB tools for these — NEVER the web.
+- The INTERNET (search_web) is for live, real-world context NOT in our database:
+  current exchange rates, weather/forecasts, local news & safety advisories,
+  strikes/closures, holidays, festivals, and special events.
+- If the user asks about weather, current events, news, or live exchange rates,
+  plan a search_web step for it.
+
 CRITICAL RULES FOR PLANNING:
 1. Each step must call a DIFFERENT piece of information (no duplicates).
-2. Tool Awareness: You MUST ONLY plan steps that can be resolved using the exact tools listed above. Never invent tools or services (e.g., do not plan for weather checks if no weather tool exists).
+2. Tool Awareness: You MUST ONLY plan steps that can be resolved using the exact tools listed above. Never invent tools or services. Respect the source-of-truth boundary above: bookable items → DB tools, live external info → search_web.
 3. Parallel Execution (Batching): The downstream Executor can use multiple tools simultaneously. Group independent data-gathering tasks into a SINGLE step, but DO NOT call more then 2 tools per step. 
    - Good: "Fetch flights, and hotels for Tokyo."
    - Bad (Too slow): Step 1: "Fetch flights to Tokyo", Step 2: "Fetch hotels in Tokyo".
@@ -249,7 +300,6 @@ def plan_node(state: PlanExecuteState):
     #     f"New User Request: {state['input']}"
     # )
      
-    print(f"\n[Planner] Generating plan for request: {state['input']}")
     try:
         plan = planner_model.invoke(prompt)
     except Exception as e:
@@ -322,6 +372,16 @@ Location resolution rules (apply before calling any fetch tool):
 3. If lookup returns a direct match, use that value for the fetch tool.
 4. CRITICAL: Never invent prices or tool results.
 
+Web search rules (search_web — for live info NOT in the database: exchange rates,
+weather, news/advisories, special events):
+- You MUST pass a `category`, one of: "exchange", "weather", "news", "events".
+  Pick the one that fits the user's intent (e.g. a forecast → "weather",
+  a currency rate → "exchange", a safety advisory or strike → "news",
+  a festival or holiday → "events").
+- The result may include an "ANSWER:" line with the actual value (temperature,
+  rate, etc.). Report that value and cite the trusted source. If there is no
+  ANSWER line, summarise the snippets — do NOT fabricate a number.
+
 After executing the step, provide a brief text summary of what you found.
 """
 
@@ -384,7 +444,8 @@ def execute_node(state: PlanExecuteState):
         #  INFINITE LOOP GUARD: Check if the model generated an identical tool call
         # -------------------------------------------------------------------------
         if hasattr(response, "tool_calls") and response.tool_calls:
-            print(f"\n[Debug] Executor actually triggered tools: {[tc.get('name') for tc in response.tool_calls]}")
+            for tc in response.tool_calls:
+                print(f"    → calling {_format_call(tc)}")
             for tc in response.tool_calls:
                 args_str = json.dumps(tc.get("args", {}), sort_keys=True)
                 current_call = (tc.get("name"), args_str)
@@ -439,6 +500,17 @@ def after_tools(state: PlanExecuteState):
     current_step = state["plan"][0] if state["plan"] else "?"
     step_record = f"Step '{current_step}': {summary}"
 
+    # Isolate just THIS step's tool messages for the console trace (everything
+    # after the most recent "[Step] ..." marker), so we don't reprint history.
+    step_tool_msgs = []
+    for m in reversed(state["messages"]):
+        if isinstance(m, HumanMessage) and isinstance(m.content, str) \
+                and m.content.startswith("[Step]"):
+            break
+        if isinstance(m, ToolMessage):
+            step_tool_msgs.append(m)
+    step_tool_msgs.reverse()
+
     new_cost = _extract_cost(tool_msgs)
     total_cost = state.get("calculated_total", 0.0) + new_cost
 
@@ -449,7 +521,8 @@ def after_tools(state: PlanExecuteState):
             existing_prefs[k] = v
             print(f"[Memory] Saved preference: {k}={v}")
 
-    print(f"\n[Debug] Summary saved to past_steps:\n{step_record}")
+    for m in step_tool_msgs:
+        print(f"      ✓ {m.name}: {_digest_tool_result(m.content)}")
     return {
         "past_steps": state.get("past_steps", []) + [step_record],
         "plan": state["plan"][1:],   # advance to the next step
@@ -505,28 +578,6 @@ def no_match_injector_node(state: PlanExecuteState) -> dict:
         "plan": [],
     }
 
-
-# ---------------------------------------------------------------------------
-# Node: replan
-# ---------------------------------------------------------------------------
-
-# REPLANNER_SYSTEM = """You are a travel planning supervisor reviewing execution progress.
-
-# Decide between two actions:
-# A) FinalResponse: ONLY use this if ALL information goals (flights, hotels, etc.) were successfully 
-#    retrieved and you have data to build a complete plan, OR if the database definitively confirms 
-#    that no options exist and no further alternatives can be checked. Never dump raw rows — narrate.
-# B) Plan: Use this if steps remain OR if a previous step failed/returned no results (e.g., 'No flights found'). 
-#    If a flight lookup fails, YOUR REVISED PLAN MUST PROACTIVELY INCLUDE A STEP TO FIND ALTERNATIVES 
-#    (like checking connecting flights via find_connecting_flights or suggesting alternative nearby destinations).
-
-# Rules for revising plans:
-# - Do NOT re-add a step that already appears in the completed history with the exact same target parameters.
-# - If a step failed, adapt the plan dynamically. Do not emit an empty plan or repeat the failing step blindly.
-# - CRITICAL: If the history contains a SYSTEM NOTE listing available destinations, you MUST only suggest 
-#   destinations from that exact list. Never invent or hallucinate unlisted destinations.
-# - If budget was provided and the total cost exceeds it, mention this clearly.
-# """
 
 
 REPLANNER_SYSTEM = """You are a highly analytical Travel Planning Supervisor. 
