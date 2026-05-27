@@ -19,6 +19,7 @@ Preserved from Session 4:
 """
 
 import json
+import os
 import re
 import sqlite3
 from typing import Annotated, List, Union
@@ -26,6 +27,7 @@ from typing import Annotated, List, Union
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -57,7 +59,7 @@ load_dotenv()
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_EXECUTOR_STEPS = 8   # tool calls the executor may make per step
+MAX_EXECUTOR_STEPS = 4   # tool calls the executor may make per step
 MAX_REPLAN_CYCLES  = 6   # how many times the replanner may issue a new plan
 
 BANNER = r"""
@@ -127,6 +129,18 @@ planner_model   = _base_model.with_structured_output(Plan)
 replanner_model = _base_model.with_structured_output(ReplanAction)
 executor_model  = _base_model.bind_tools(tools)
 
+# _base_model = ChatGroq(
+#     api_key=os.getenv("GROQ_API_KEY"),
+#     model="llama-3.3-70b-versatile", 
+#     temperature=0.4,
+#     max_retries=1
+# )
+
+# # Keep these exactly as they are! They will now automatically use Groq:
+# planner_model   = _base_model.with_structured_output(Plan)
+# replanner_model = _base_model.with_structured_output(ReplanAction)
+# executor_model  = _base_model.bind_tools(tools)
+
 def _extract_budget(text: str) -> float:
     m = re.search(r"\$\s?([\d,]+)|([\d,]+)\s?(?:\$|dollars?)", text, re.IGNORECASE)
     if m:
@@ -150,7 +164,7 @@ def _no_match_detected(messages: list) -> bool:
     True only on CASE B — a genuine mismatch where the executor explicitly
     returned "NO_MATCH:<term>" as its response.
     CASE A (no_direct_match dict) is intentionally excluded: the executor
-    should handle those by silently mapping to the closest available location.
+    should handle those by silently mapping to the semantic-equivalent available location.
     """
     for m in messages:
         # Check executor AIMessage content for the NO_MATCH signal
@@ -180,16 +194,22 @@ def _extract_cost(messages: list) -> float:
 # Node: planner
 # ---------------------------------------------------------------------------
 
-PLANNER_SYSTEM = """You are a senior travel planning strategist.
-Given a user travel request, produce an ordered list of UNIQUE steps.
+PLANNER_SYSTEM = """You are an expert travel planning strategist.
+Your goal is to break down the user's travel request into a logical, efficient sequence of UNIQUE execution steps.
 
-Rules:
-- Each step must call a DIFFERENT piece of information (no duplicates).
-- Start with resolving the location via lookup_location_options.
-- If the request asks for both flights and hotels, list them as separate steps.
-- Include a cost calculation step at the end if pricing is needed.
-- Prefer parallel-friendly ordering (lookup first, then fetches, then cost).
-- Maximum 6 steps. Keep each step one sentence.
+AVAILABLE TOOLS:
+{tool_descriptions}
+
+CRITICAL RULES FOR PLANNING:
+1. Each step must call a DIFFERENT piece of information (no duplicates).
+2. Tool Awareness: You MUST ONLY plan steps that can be resolved using the exact tools listed above. Never invent tools or services (e.g., do not plan for weather checks if no weather tool exists).
+3. Parallel Execution (Batching): The downstream Executor can use multiple tools simultaneously. Group independent data-gathering tasks into a SINGLE step, but DO NOT call more then 2 tools per step. 
+   - Good: "Fetch flights, and hotels for Tokyo."
+   - Bad (Too slow): Step 1: "Fetch flights to Tokyo", Step 2: "Fetch hotels in Tokyo".
+4. Dependency Ordering: If a step inherently depends on the result of another, place it in a SUBSEQUENT step. 
+   - Example: You must gather all trip components (flights, hotels) in early steps BEFORE adding a final step to "Calculate total trip cost".
+5. Do Not use all the available tools just for the sake of it. Only include tools that are relevant to the user's request. Irrelevant steps waste time and risk hitting token limits.
+6. Simplicity: Maximum 6 steps. Keep step descriptions concise and focused on the data needed. Do not plan formatting or summarization steps (the system handles the final output automatically).
 """
 
 
@@ -202,10 +222,11 @@ def plan_node(state: PlanExecuteState):
     history_context = ""
     if state.get("chat_history"):
         history_context = f"Past conversation context:\n{state['chat_history']}"
-    # Inject both the historical context and the fresh user input into the prompt    
+    tool_descriptions = "\n".join([f"- {t.name}: {t.description.splitlines()[0]}" for t in tools])
+    # Inject the historical context, the available tools and the fresh user input into the prompt    
     prompt = (
-        f"{PLANNER_SYSTEM}\n\n"
-        f"{history_context}\n"
+    PLANNER_SYSTEM.format(tool_descriptions=tool_descriptions) + "\n\n"
+    f"{history_context}\n"
         f"New User Request: {state['input']}"
     )
     
@@ -228,7 +249,7 @@ def plan_node(state: PlanExecuteState):
     #     f"New User Request: {state['input']}"
     # )
      
-
+    print(f"\n[Planner] Generating plan for request: {state['input']}")
     try:
         plan = planner_model.invoke(prompt)
     except Exception as e:
@@ -287,7 +308,7 @@ EXECUTOR_SYSTEM = """You are a travel data retrieval agent.
 Execute ONLY the current step listed below using the available tools.
 Do not skip ahead or repeat tool calls you already made.
 
-Location resolution rules (apply BEFORE calling any fetch tool):
+Location resolution rules (apply before calling any fetch tool):
 1. Call lookup_location_options to resolve any city/country name.
 2. If it returns a list of available_locations with no exact match:
    CASE A — Semantic equivalence (country→airport, region→city):
@@ -299,6 +320,7 @@ Location resolution rules (apply BEFORE calling any fetch tool):
      Action: stop and return the string "NO_MATCH:<search_term>" as your
              response. Do not call any further tools.
 3. If lookup returns a direct match, use that value for the fetch tool.
+4. CRITICAL: Never invent prices or tool results.
 
 After executing the step, provide a brief text summary of what you found.
 """
@@ -362,6 +384,7 @@ def execute_node(state: PlanExecuteState):
         #  INFINITE LOOP GUARD: Check if the model generated an identical tool call
         # -------------------------------------------------------------------------
         if hasattr(response, "tool_calls") and response.tool_calls:
+            print(f"\n[Debug] Executor actually triggered tools: {[tc.get('name') for tc in response.tool_calls]}")
             for tc in response.tool_calls:
                 args_str = json.dumps(tc.get("args", {}), sort_keys=True)
                 current_call = (tc.get("name"), args_str)
@@ -426,6 +449,7 @@ def after_tools(state: PlanExecuteState):
             existing_prefs[k] = v
             print(f"[Memory] Saved preference: {k}={v}")
 
+    print(f"\n[Debug] Summary saved to past_steps:\n{step_record}")
     return {
         "past_steps": state.get("past_steps", []) + [step_record],
         "plan": state["plan"][1:],   # advance to the next step
@@ -505,21 +529,54 @@ def no_match_injector_node(state: PlanExecuteState) -> dict:
 # """
 
 
-REPLANNER_SYSTEM = """You are a travel planning supervisor reviewing execution progress.
+REPLANNER_SYSTEM = """You are a highly analytical Travel Planning Supervisor. 
+Your core responsibility is to evaluate the executed steps against the user's ORIGINAL GOAL.
 
-Decide between two actions:
-A) FinalResponse: Use this if all goals are met, OR if the database definitively confirms no options exist and no valid alternatives can be offered.
-B) Plan: Use this to revise the plan if steps remain, or if a previous step failed.
+AVAILABLE TOOLS YOU CAN USE IN NEW PLANS:
+{tool_descriptions}
 
-Rules for revising plans:
-1. NO FORCED FLIGHTS: Do not add flight searches for domestic/local trips.
-2. FLIGHT FAILURES: If a requested flight search fails, add a step to use 'find_connecting_flights'.
-3. SMART ALTERNATIVES: If connecting flights also fail, or if a destination is totally unreachable, 
-add a step to use the 'suggest_alternatives' tool with the user's origin city to find real, valid destinations.
-4. DO NOT repeat a failed step with the exact same parameters.
-- Do NOT re-add a step that already appears in the completed history.
-5. MEMORY: Consider the user's past conversation history (provided below) to tailor your alternative suggestions to their preferences (explicit/not).
-6. If budget was provided and the total cost exceeds it, mention this clearly.
+EVALUATION CRITERIA:
+1. Are all EXPLICIT user requests (flights, specific hotel stars, specific airlines, budget) fulfilled?
+2. Is the logical flow complete?
+
+CONSTRAINT RELAXATION LOGIC (When exact matches fail):
+If a search fails because of strict constraints (e.g., budget too low, required airline unavailable, 5-star hotels fully booked):
+- DO NOT give up immediately and DO NOT return an empty response.
+- GENERATE A NEW PLAN (Action: Plan) to search again by intentionally relaxing the constraints.
+- Examples of relaxing constraints: drop the airline requirement, ignore the budget limit, lower the star rating...
+
+STRATEGIC GUIDELINES FOR FAILURES & ALTERNATIVES:
+Instead of giving up when a search fails, use your reasoning to decide the best recovery strategy based on the USER'S INTENT.
+
+1. Destination-First Priority: 
+   If the user requests a specific destination, your absolute top priority is getting them there. 
+   - If direct flights fail, IMMEDIATELY generate a NEW Plan (Action: Plan) using 'find_connecting_flights'. 
+   - If connecting flights also fail, you must generate a NEW Plan using 'suggest_alternatives' to find alternative reachable destinations.
+
+2. The "Direct Flight" Dilemma (Ambiguity Rule): 
+   If the user explicitly demanded a "direct" flight to a specific destination and none exist, their true priority is ambiguous (Do they care more about the destination, or about flying direct?). 
+   - DO NOT GUESS. Instead, gather data for both scenarios: Generate a NEW Plan to simultaneously use 'find_connecting_flights' (for their requested destination) AND 'suggest_alternatives' (to find places with direct flights). 
+   - Once you have the results, issue a FinalResponse presenting the dilemma with the actual options. (Example: "I couldn't find a direct flight to Tokyo. I can offer you a connecting flight to Tokyo for $900, or direct flights to Paris or London. What do you prefer?").
+
+3. The "Never Empty-Handed" Rule (Constraint Relaxation):
+   If any search fails due to strict user constraints (e.g., specific airline, budget limit, hotel stars, specific dates), you MUST NOT return a failure message with zero options. 
+   - You must generate a NEW Plan (Action: Plan) that intentionally relaxes the failing constraint to find the closest possible match. 
+   - When issuing the FinalResponse, clearly present this as a fallback. (Example: "I couldn't find an El Al flight, but Air France has a flight for $400.").
+
+USING USER CONTEXT FOR ALTERNATIVES:
+When relaxing constraints or suggesting new destinations, you MUST base your strategic choices on:
+- The user's stored preferences and past chat history (provided below).
+- Logical similarities (e.g., same continent, similar climate, similar luxury level to their original request).
+
+DECISION ACTIONS:
+A) Action: FinalResponse
+   - Use if the original goal is fully met.
+   - Use if you successfully found alternatives after relaxing constraints. CRITICAL: You MUST explicitly and clearly state to the user which original constraint was broken (e.g., "I couldn't find a 5-star hotel under $500, but I found this highly-rated option for $800" or "Direct flights were unavailable, so I found an alternative with a connection").
+   - Use if you have exhausted all relaxed searches and absolutely nothing is available.
+
+B) Action: Plan
+   - Use to generate new steps to relax constraints or suggest alternatives when initial searches fail.
+   - Be specific: write "Call fetch_hotels in Paris without budget constraint" rather than just "Find alternatives".
 """
 
 def replan_node(state: PlanExecuteState):
@@ -527,34 +584,22 @@ def replan_node(state: PlanExecuteState):
     budget = state.get("total_budget", 0.0)
     total_cost = state.get("calculated_total", 0.0)
 
-    # -------------------------------------------------------------------------
-    # FAST-TRACK ERROR HANDLING:
+    # 1. FAST-TRACK ERROR HANDLING:
     # If the Executor already caught an API error, bypass the Replanner entirely.
-    # Do not try to summarize, just pass the error directly to the Formatter.
-    # -------------------------------------------------------------------------
     if state.get("response", "").startswith("[ERROR]"):
         print("\n[Replanner] ⚠️  Detected upstream execution error. Bypassing LLM summary.")
         return {
             "plan": [],
-            # Keep the existing error response intact
         }
 
-    # -------------------------------------------------------------------------
-    # CLEAN MEMORY INJECTION: Read from chat_history instead of messages
-    # -------------------------------------------------------------------------
+    # Extract historical context for the prompt
     history_context = ""
     if state.get("chat_history"):
         history_context = f"Past conversation context:\n{state['chat_history']}"
-        
-    # Safety: force a final answer if we've re-planned too many times or plan is empty
-    if replan_count > MAX_REPLAN_CYCLES or not state["plan"]:
-        force_final = replan_count > MAX_REPLAN_CYCLES
-        
-        if force_final:
-            print(f"\n[Replanner] ⚠️  Replan limit ({MAX_REPLAN_CYCLES}) reached — forcing final answer.")
-        else:
-            print("\n[Replanner] ✅ All planned steps completed successfully. Generating final response.")
 
+    # 2. SAFETY LOOP BREAKER (MAX_REPLAN_CYCLES)
+    if replan_count > MAX_REPLAN_CYCLES:
+        print(f"\n[Replanner] ⚠️  Replan limit ({MAX_REPLAN_CYCLES}) reached — forcing final answer.")
         past_steps_text = "\n".join(state.get("past_steps", [])) or "(none)"
         budget_note = (
             f"\nBudget provided: ${budget:.2f}. Estimated total: ${total_cost:.2f}."
@@ -572,11 +617,8 @@ def replan_node(state: PlanExecuteState):
             "If suggesting alternatives, explicitly mention the options found via tools."
         )
         
-        # -------------------------------------------------------------------------
-        # BULLETPROOF SUMMARY GENERATION:
         # Wrap the final LLM call in try/except. If the API fails now, use plain Python
         # to stitch together a raw fallback summary without relying on the model.
-        # -------------------------------------------------------------------------
         try:
             final_msg = _base_model.invoke(final_prompt)
             final_text = final_msg.content
@@ -597,23 +639,35 @@ def replan_node(state: PlanExecuteState):
             "replan_count": replan_count,
         }
             
+    # 3. PREPARE PROMPT FOR STRATEGIC EVALUATION
     past_steps_text = "\n".join(state.get("past_steps", [])) or "(none)"
-    remaining_text = "\n".join(f"  - {s}" for s in state["plan"])
+    
+    # If the execution queue is empty, dynamically instruct the LLM to evaluate completeness
+    if state["plan"]:
+        remaining_text = "\n".join(f"  - {s}" for s in state["plan"])
+    else:
+        remaining_text = (
+            "(The execution queue is currently empty. Please thoroughly evaluate if the user's Original Goal "
+            "and all constraints are fully satisfied. If yes, issue a FinalResponse. If gaps or failures exist, "
+            "generate a NEW Plan using Constraint Relaxation or althernative destinations to resolve them.)"
+        )
+
     budget_note = (
         f"Budget: ${budget:.2f}. Running total so far: ${total_cost:.2f}."
-        if budget > 0 else ""
+        if budget > 0 else "No specific budget limit provided."
     )
+    tool_descriptions = "\n".join([f"- {t.name}: {t.description.splitlines()[0]}" for t in tools])
 
     prompt = (
-        f"{REPLANNER_SYSTEM}\n\n"
-        f"{history_context}\n\n"
+        REPLANNER_SYSTEM.format(tool_descriptions=tool_descriptions) + "\n\n"        f"{history_context}\n\n"
         f"Original goal: {state['input']}\n\n"
         f"Completed steps:\n{past_steps_text}\n\n"
         f"Remaining planned steps:\n{remaining_text}\n\n"
         f"{budget_note}\n\n"
-        "What should happen next?"
+        "What should happen next? Evaluate carefully and choose the correct action schema."
     )
 
+    # 4. INVOKE THE REPLANNER MODEL
     try:
         result = replanner_model.invoke(prompt)
     except Exception as e:
@@ -623,6 +677,7 @@ def replan_node(state: PlanExecuteState):
 
     print(f"\n[Replanner] Decision: {type(result.action).__name__}")
 
+    # 5. EXECUTE THE DECISION SCHEMA
     if isinstance(result.action, FinalResponse):
         budget_warn = ""
         if budget > 0 and total_cost > budget:
@@ -634,7 +689,7 @@ def replan_node(state: PlanExecuteState):
             "over_budget": budget > 0 and total_cost > budget,
         }
 
-    # Revised plan — strip any steps already done
+    # Action is a revised Plan — strip any steps already done to prevent loops
     done_keys = {s.split(":")[0].strip().lower() for s in state.get("past_steps", [])}
     new_steps = [
         s for s in result.action.steps
@@ -648,8 +703,8 @@ def replan_node(state: PlanExecuteState):
     return {
         "plan": new_steps,
         "replan_count": replan_count,
+        "response": ""
     }
-
 # ---------------------------------------------------------------------------
 # Routing after replan
 # ---------------------------------------------------------------------------
@@ -744,12 +799,12 @@ builder.add_conditional_edges(
 )
 
 builder.add_edge("tools",             "after_tools_node")
-builder.add_edge("no_match_injector", "replan")
 
 builder.add_conditional_edges(
     "after_tools_node", route_after_tools,
     {"execute": "execute", "replan": "replan", "no_match": "no_match_injector"},
 )
+builder.add_edge("no_match_injector", "replan")
 
 builder.add_conditional_edges(
     "replan", should_end,

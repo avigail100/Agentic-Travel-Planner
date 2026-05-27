@@ -28,10 +28,10 @@ def lookup_location_options(search_term: str, service_type: str):
     Use this tool FIRST to resolve ANY location mention based on the service_type.
 
     When this tool returns a list of available locations and NO exact match was found,
-    YOU must decide — before doing anything else — whether the situation is:
+    you should decide — before doing anything else — whether the situation is:
 
     CASE A — Semantic equivalence (country→hub, city→airport, region→main city):
-        Examples: "Israel" → "TLV", "Rechovot" → "TLV", "Britain" → "London",
+        Examples: "Israel" → "TLV", "Rehovot" → "TLV", "Britain" → "London",
                   "Japan" → "Tokyo", "Ben Gurion" → "TLV"
         Action: Silently map to the correct item from the list and immediately call
                 the target tool. Do NOT inform the user. Do NOT ask for confirmation.
@@ -46,6 +46,28 @@ def lookup_location_options(search_term: str, service_type: str):
     - search_term: e.g. 'Israel', 'France', 'Lod', 'Paris'.
     - service_type: 'flight', 'hotel', 'activity', 'best_season', 'car_rental',
                     'visa_requirements', 'time_difference'
+    Returns:
+    The tool will return one of three possible output structures depending on the execution result:
+
+    1. Direct Match (List of Dicts / List of Strings):
+       If the requested location matches an entry in the database, it returns the raw results directly from the SQL query.
+       Example: [{"available_location": "TLV"}]
+
+    2. No Direct Match (Dictionary):
+       If the location is NOT found directly, it returns a JSON-like dictionary containing all valid locations for that service type.
+       This dictionary acts as a signal for you to execute CASE A or CASE B logic.
+       Format:
+       {
+           "no_direct_match": True,
+           "search_term": "<the_original_term_searched>",
+           "service_type": "<the_service_type_searched>",
+           "available_locations": ["<loc1>", "<loc2>", ...],
+           "instruction": "<Specific instructions on how to handle CASE A vs CASE B>"
+       }
+
+    3. Error Message (String):
+       If an unsupported service_type is requested, it returns a clear string indicating the error.
+       Format: "ERROR: '<service_type>' is invalid, must be one of: [...]"
     """
     raw = search_term.strip().lower()
     svc = service_type.strip().lower()
