@@ -28,10 +28,10 @@ def lookup_location_options(search_term: str, service_type: str):
     Use this tool FIRST to resolve ANY location mention based on the service_type.
 
     When this tool returns a list of available locations and NO exact match was found,
-    YOU must decide — before doing anything else — whether the situation is:
+    you should decide — before doing anything else — whether the situation is:
 
     CASE A — Semantic equivalence (country→hub, city→airport, region→main city):
-        Examples: "Israel" → "TLV", "Rechovot" → "TLV", "Britain" → "London",
+        Examples: "Israel" → "TLV", "Rehovot" → "TLV", "Britain" → "London",
                   "Japan" → "Tokyo", "Ben Gurion" → "TLV"
         Action: Silently map to the correct item from the list and immediately call
                 the target tool. Do NOT inform the user. Do NOT ask for confirmation.
@@ -46,6 +46,28 @@ def lookup_location_options(search_term: str, service_type: str):
     - search_term: e.g. 'Israel', 'France', 'Lod', 'Paris'.
     - service_type: 'flight', 'hotel', 'activity', 'best_season', 'car_rental',
                     'visa_requirements', 'time_difference'
+    Returns:
+    The tool will return one of three possible output structures depending on the execution result:
+
+    1. Direct Match (List of Dicts / List of Strings):
+       If the requested location matches an entry in the database, it returns the raw results directly from the SQL query.
+       Example: [{"available_location": "TLV"}]
+
+    2. No Direct Match (Dictionary):
+       If the location is NOT found directly, it returns a JSON-like dictionary containing all valid locations for that service type.
+       This dictionary acts as a signal for you to execute CASE A or CASE B logic.
+       Format:
+       {
+           "no_direct_match": True,
+           "search_term": "<the_original_term_searched>",
+           "service_type": "<the_service_type_searched>",
+           "available_locations": ["<loc1>", "<loc2>", ...],
+           "instruction": "<Specific instructions on how to handle CASE A vs CASE B>"
+       }
+
+    3. Error Message (String):
+       If an unsupported service_type is requested, it returns a clear string indicating the error.
+       Format: "ERROR: '<service_type>' is invalid, must be one of: [...]"
     """
     raw = search_term.strip().lower()
     svc = service_type.strip().lower()
@@ -164,6 +186,25 @@ def find_connecting_flights(origin: str, destination: str):
         return f"No connecting flights found with exactly one stop from {origin} to {destination}."
     
     return matches
+
+@tool
+def suggest_alternatives(origin: str):
+    """
+    Find available alternative flight destinations from a specific origin city.
+    Use this ONLY when the originally requested destination is unreachable (direct or connection flights) or flights are unavailable.
+    Input: The origin city (e.g., 'Tel Aviv', 'London').
+    """
+    query = "SELECT DISTINCT destination FROM flights WHERE LOWER(origin) = ?"
+    origin_param = origin.strip().lower()
+    
+    matches = _run_query(query, (origin_param,))
+    
+    if not matches or isinstance(matches, str):
+        return f"No alternative flight destinations found departing from {origin}."
+    
+    # Extract just the destination names into a clean list
+    destinations = [row["destination"] for row in matches if "destination" in row]
+    return f"Available destinations from {origin}: {', '.join(destinations)}"
 
 @tool
 def fetch_hotels(city: str, max_price: int = None):
@@ -503,6 +544,151 @@ def convert_time_to_destination_timezone(time_in_origin_timezone: str, time_diff
         return destination_time.strftime("%Y-%m-%d %H:%M")
     except Exception as e:
         return f"Error converting time: {e}"
+
+# Trusted source allowlists per category. The LLM chooses the category (it
+# understands the user's intent); the tool then biases Tavily toward these hosts
+# via include_domains AND hard-enforces them in code, so results only come from
+# reputable sources. "events" is open web — there's no single canonical source.
+_WEB_SOURCES = {
+    "news":     ["bbc.com", "reuters.com", "apnews.com"],
+    "exchange": ["xe.com", "x-rates.com"],
+    "weather":  ["weather.com", "accuweather.com"],
+    "events":   ["reuters.com"],
+}
+
+
+def _host_on_allowlist(result: dict, hosts: list) -> bool:
+    """True only if a search result's URL is https AND its hostname is on the
+    allowlist. Matches the parsed hostname (or a subdomain of it), never a loose
+    substring, so spoofs like https://evil.com/bbc.com are rejected."""
+    from urllib.parse import urlparse
+
+    url = (result.get("href") or result.get("url") or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+    netloc = parsed.netloc.lower().split(":")[0]  # drop any :port
+    return any(netloc == h or netloc.endswith("." + h) for h in hosts)
+
+
+@tool
+def search_web(query: str, category: str) -> str:
+    """
+    Search the live internet for real-world, time-sensitive travel information that is
+    NOT stored in our database.
+
+    USE THIS TOOL ONLY FOR: current currency/exchange rates, weather and forecasts,
+    local news, public safety advisories, strikes/closures, holidays, festivals, and
+    special events at a destination.
+
+    DO NOT use this tool for flights, hotels, activities, car rentals, or
+    time differences — those come exclusively from the database tools (the single
+    source of truth). Never use this tool to invent prices for bookable items.
+
+    YOU must choose the correct `category` based on what the user is asking about.
+    Each category restricts results to its trusted sources:
+      - "exchange" → currency / exchange-rate questions (xe.com, x-rates.com)
+      - "weather"  → weather & forecasts (weather.com, accuweather.com)
+      - "news"     → news, safety advisories, strikes, closures (bbc.com, reuters.com, apnews.com)
+      - "events"   → festivals, holidays, concerts, special events (general trusted web)
+
+    Input:
+    - query: a focused natural-language query, e.g. "current USD to EUR exchange rate"
+             or "weather in Tokyo late May 2026" or "special events in Paris June 2026".
+    - category: one of "exchange", "weather", "news", "events".
+    Returns: a synthesized direct answer (when available) plus the supporting
+             trusted-source snippets, or a message indicating no results were found.
+    """
+    cleaned = query.strip()
+    if not cleaned:
+        return "No search query provided."
+
+    cat = category.strip().lower()
+    if cat not in _WEB_SOURCES:
+        return (
+            f"Invalid category '{category}'. "
+            f"Choose one of: {list(_WEB_SOURCES.keys())}."
+        )
+
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return (
+            "Error: web search is unavailable — TAVILY_API_KEY is not set. "
+            "Add it to your .env file."
+        )
+
+    import requests
+
+    hosts = _WEB_SOURCES[cat]
+    # Tavily's news topic returns recent, dated articles — ideal for advisories,
+    # strikes, and closures. Everything else uses the general topic.
+    topic = "news" if cat == "news" else "general"
+
+    payload = {
+        "query": cleaned,
+        "search_depth": "basic",
+        "topic": topic,
+        "include_answer": True,   # Tavily synthesizes a direct answer (e.g. the actual rate/temp)
+        "max_results": 8,
+    }
+    if hosts:
+        # Bias Tavily toward the trusted hosts; we still hard-enforce below.
+        payload["include_domains"] = hosts
+    if topic == "news":
+        payload["days"] = 14   # only recent news
+
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError:
+        code = resp.status_code
+        if code in (401, 403):
+            return "Web search failed: Tavily rejected the API key (check TAVILY_API_KEY)."
+        if code == 429:
+            return "Web search failed: Tavily rate limit / quota exceeded. Try again later."
+        return f"Web search failed: Tavily returned HTTP {code}."
+    except Exception as e:
+        return f"Web search failed: {e}"
+
+    results = data.get("results") or []
+
+    # HARD-enforce the allowlist so no off-list host can leak through. Match on
+    # the parsed hostname (not a loose substring) and require https, so a spoofed
+    # URL like https://evil.com/bbc.com or any http:// result can't slip past.
+    if hosts:
+        results = [r for r in results if _host_on_allowlist(r, hosts)]
+
+    answer = (data.get("answer") or "").strip()
+    results = results[:5]
+
+    if not answer and not results:
+        if hosts:
+            return (
+                f"No results from trusted {cat} sources ({', '.join(hosts)}) "
+                f"for: {cleaned}."
+            )
+        return f"No web results found for: {cleaned} (category: {cat})."
+
+    lines = [f"Web search results for '{cleaned}' [category: {cat}]:"]
+    if answer:
+        lines.append(f"ANSWER: {answer}")
+    for i, r in enumerate(results, 1):
+        title = (r.get("title") or "").strip()
+        content = (r.get("content") or "").strip()
+        if len(content) > 400:
+            content = content[:400] + "…"
+        url = r.get("url") or r.get("href") or ""
+        date = (r.get("published_date") or "").strip()
+        date_str = f" ({date[:10]})" if date else ""
+        lines.append(f"{i}. {title}{date_str}\n   {content}\n   Source: {url}")
+    return "\n".join(lines)
+
 
 @tool
 def save_preference(key: str, value: str) -> str:
