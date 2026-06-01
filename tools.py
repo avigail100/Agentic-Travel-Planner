@@ -127,7 +127,8 @@ def fetch_flights(origin: str, destination: str = None):
     If you dont get destintion and only origin, Return all the flights from this origin to all destinations.
     Input: EXACT location names retrieved from the lookup_location_options tool.
             Destination can be None to fetch all flights from the origin to any destination.
-    Returns: List of matching flights with origin, airline, price, and flight number, destination. If no matches, return a message indicating no flights found.
+    Returns: List of matching flights with destination, airline, price, flight number, availability, duration, departure time and arrival time. 
+    If no matches, return a message indicating no flights found.
     """
     
     # Pre-processing inputs to match the database format
@@ -136,10 +137,10 @@ def fetch_flights(origin: str, destination: str = None):
     if destination is not None:
         dest_param = destination.strip().lower()
         # Using LOWER() to ensure case-insensitive matching in the database
-        query = "SELECT airline, price, flight_number, destination FROM flights WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
+        query = "SELECT airline, price, flight_number, destination, duration_hours, departure_time, arrival_time FROM flights WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
         matches = _run_query(query, (origin_param, dest_param))
     else:
-        query = "SELECT airline, price, flight_number, destination FROM flights WHERE LOWER(origin) = ?"
+        query = "SELECT airline, price, flight_number, destination, duration_hours, departure_time, arrival_time FROM flights WHERE LOWER(origin) = ?"
         matches = _run_query(query, (origin_param,))
     
     if not matches or isinstance(matches, str):
@@ -210,8 +211,9 @@ def fetch_hotels(city: str, max_price: int = None):
     """
     Find hotels in a specific city from the database.
     Input: city name (string), max_price (optional integer).
+    When showing hotel results to the user, include ALL returned fields (name, price_per_night, stars, amenities, rating, room_type, breakfast_included) to give them a complete picture of the options available.
     """
-    query = "SELECT name, price_per_night, stars FROM hotels WHERE LOWER(city) = ?"
+    query = "SELECT name, price_per_night, stars, amenities, rating, room_type, breakfast_included FROM hotels WHERE LOWER(city) = ?"
     params = [city.strip().lower()]
     
     if max_price is not None:
@@ -222,6 +224,34 @@ def fetch_hotels(city: str, max_price: int = None):
     
     if not matches or isinstance(matches, str):
         return f"No hotels found in {city} meeting those criteria."
+    return matches
+
+@tool
+def find_hotels_by_amenity(amenity: str, max_price: int = None):
+    """
+    Find hotels across all cities that include a specific amenity.
+    Use this when the user asks for hotels with spa, pool, WiFi, breakfast, etc.,
+    and does not specify a city.
+    """
+
+    query = """
+    SELECT city, name, price_per_night, stars, amenities,
+           rating, room_type, breakfast_included
+    FROM hotels
+    WHERE LOWER(amenities) LIKE ?
+    """
+
+    params = [f"%{amenity.strip().lower()}%"]
+    if max_price is not None:
+        query += " AND price_per_night <= ?"
+        params.append(max_price)
+
+    matches = _run_query(query, tuple(params))
+    print("matches:", matches)
+
+    if not matches or isinstance(matches, str):
+        return f"No hotels found with amenity: {amenity}."
+
     return matches
 
 @tool
@@ -267,8 +297,9 @@ def fetch_activities(city: str, max_price: int = None):
     """
     Find activities in a specific city from the database.
     Input: city name (string), max_price (optional integer).
+    When presenting activity results, include all returned fields (name, price, category, duration, suitable_for) to give the user a comprehensive view of their options.
     """
-    query = "SELECT name, price, category FROM activities WHERE LOWER(city) = ?"
+    query = "SELECT name, price, category, duration, suitable_for FROM activities WHERE LOWER(city) = ?"
     params = [city.strip().lower()]
     
     if max_price is not None:
@@ -288,9 +319,9 @@ def fetch_visa_requirements(origin: str, destination: str):
     IMPORTANT: This tool uses country names so if you get from the user a city name, change it to the relevant country name first before calling this tool.
     for example if the user says "I want to travel from Tel Aviv to Paris", you should resolve "Tel Aviv" to origin="israel", destination="france" before calling this tool.
     you do this by first mapping the city to the country and then calling this tool with the resolved country names.
-    Returns visa requirement policy and the amount of days you can stay without a visa.
+    Returns visa requirement policy, the amount of days you can stay without a visa and the visa type.
     """
-    query = "SELECT days_allowed_without_visa, policy FROM visa_requirements WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
+    query = "SELECT days_allowed_without_visa, policy, visa_type FROM visa_requirements WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
     origin_param = origin.strip().lower()
     dest_param = destination.strip().lower()
     
@@ -308,6 +339,7 @@ def fetch_currency_exchange_rate(origin_currency: str, destination_currency: str
     for example if the user says "I want to convert from US dollars to Israeli shekels", 
     you should resolve "US dollars" to origin_currency="USD", "Israeli shekels" to destination_currency="ILS" before calling this tool.
     you do this by first mapping the currency name to the currency code and then calling this tool with the resolved currency codes.
+    This tool supports: direct exchange rates, reverse exchange rates and indirect conversions through an intermediate currency if needed
     Returns the exchange rate as of today.
     """
     query = "SELECT exchange_rate FROM exchange_rates WHERE LOWER(origin_currency) = ? AND LOWER(destination_currency) = ?"
@@ -326,6 +358,26 @@ def fetch_currency_exchange_rate(origin_currency: str, destination_currency: str
     if res_reverse and not isinstance(res_reverse, str):
         original_rate = res_reverse[0]['exchange_rate']
         return [{"exchange_rate": 1 / original_rate}]
+    
+    # Try to find a bridge currency
+    bridge_query = """
+    SELECT
+        r1.destination_currency AS bridge_currency,
+        r1.exchange_rate * r2.exchange_rate AS exchange_rate
+    FROM exchange_rates r1
+    JOIN exchange_rates r2
+        ON LOWER(r1.destination_currency) = LOWER(r2.origin_currency)
+    WHERE LOWER(r1.origin_currency) = ?
+    AND LOWER(r2.destination_currency) = ?
+    LIMIT 1
+    """
+
+    bridge_res = _run_query(bridge_query, (origin_param, dest_param))
+
+    if bridge_res and not isinstance(bridge_res, str):
+        return bridge_res
+
+    return f"No exchange rate found between {origin_currency} and {destination_currency}."
 
 @tool
 def convert_cost_to_origin_currency(cost_in_destination_currency: float, exchange_rate: float):
@@ -343,9 +395,10 @@ def convert_cost_to_origin_currency(cost_in_destination_currency: float, exchang
 def fetch_car_rental_agencies(city: str):
     """
     Fetch available car rental agencies in a specific city from the database.
-    Returns a list of car rental agencies with price per day and car types.
+    Returns a list of car rental agencies with price per day, car types, transmission, and seats.
+    Use this tool for requests about: automatic/manual cars, SUV/economy/luxury cars, family cars, number of seats, rental prices
     """
-    query = "SELECT company, airport, price_per_day, car_type FROM car_rentals WHERE LOWER(city) = ?"
+    query = "SELECT company, airport, price_per_day, car_type, transmission, seats FROM car_rentals WHERE LOWER(city) = ?"
     city_param = city.strip().lower()
     
     matches = _run_query(query, (city_param,))
@@ -359,14 +412,73 @@ def fetch_seasonal_recommendations(city: str):
     """
     Fetch seasonal travel recommendations for a specific city from the database.
     Returns the best season to visit and the months when it's ideal.
+    also include the reason for the recommendation if available (e.g. weather, events, tourist crowds) to help the user understand the context of the recommendation.
     """
-    query = "SELECT season as best_season, months as ideal_months FROM best_seasons WHERE LOWER(city) = ?"
+    query = "SELECT season as best_season, months as ideal_months, reason FROM best_seasons WHERE LOWER(city) = ?"
     city_param = city.strip().lower()
     
     matches = _run_query(query, (city_param,))
     
     if not matches or isinstance(matches, str):
         return f"No seasonal recommendations found for {city}."
+    return matches
+
+@tool
+def find_destinations_by_preference(preference: str):
+    """
+    Find destinations across all cities based on a season preference.
+    Use this when the user asks where to go based on weather, season,
+    climate, or travel timing without specifying a city.
+    Examples: warm weather, beach weather, not humid, cherry blossoms, outdoor events
+    """
+
+    month_mapping = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+
+    pref = preference.strip().lower()
+
+    # Month-based search
+    if pref in month_mapping:
+        month = month_mapping[pref]
+
+        query = """
+        SELECT city, season, months, reason
+        FROM best_seasons
+        WHERE
+            (start_month <= end_month AND ? BETWEEN start_month AND end_month)
+            OR
+            (start_month > end_month AND (? >= start_month OR ? <= end_month))
+        """
+
+        matches = _run_query(query, (month, month, month))
+
+    # General preference search
+    else:
+        query = """
+        SELECT city, season, months, reason
+        FROM best_seasons
+        WHERE LOWER(season) LIKE ?
+           OR LOWER(reason) LIKE ?
+        """
+
+        param = f"%{pref}%"
+        matches = _run_query(query, (param, param, param))
+
+    if not matches or isinstance(matches, str):
+        return f"No destinations found for preference: {preference}."
+
     return matches
 
 @tool
@@ -377,17 +489,45 @@ def fetch_time_difference(origin: str, destination: str):
     for example if the user says "I want to know the time difference between Israel and France", 
     you should resolve "Israel" to origin="Tel Aviv", "France" to destination="Paris" before calling this tool.
     you do this by first mapping the country name to the main city name and then calling this tool with the resolved city names.
+    Supports: direct lookup, reverse lookup and indirect lookup through an intermediate location.
     Returns the time difference in hours.
     """
     query = "SELECT hours_difference FROM time_differences WHERE LOWER(origin) = ? AND LOWER(destination) = ?"
     origin_param = origin.strip().lower()
     dest_param = destination.strip().lower()
     
+      # Direct lookup
     matches = _run_query(query, (origin_param, dest_param))
-    
-    if not matches or isinstance(matches, str):
-        return f"No time difference information found for {origin} to {destination}."
-    return matches
+
+    if matches and not isinstance(matches, str):
+        return matches
+
+    # Reverse lookup
+    reverse_matches = _run_query(query, (dest_param, origin_param))
+
+    if reverse_matches and not isinstance(reverse_matches, str):
+        reversed_diff = reverse_matches[0]["hours_difference"]
+        return [{"hours_difference": -reversed_diff}]
+
+    # Bridge lookup through intermediate location
+    bridge_query = """
+    SELECT
+        t1.destination AS bridge_location,
+        t1.hours_difference + t2.hours_difference AS hours_difference
+    FROM time_differences t1
+    JOIN time_differences t2
+        ON LOWER(t1.destination) = LOWER(t2.origin)
+    WHERE LOWER(t1.origin) = ?
+      AND LOWER(t2.destination) = ?
+    LIMIT 1
+    """
+
+    bridge_matches = _run_query(bridge_query, (origin_param, dest_param))
+
+    if bridge_matches and not isinstance(bridge_matches, str):
+        return bridge_matches
+
+    return f"No time difference information found for {origin} to {destination}."
 
 @tool
 def convert_time_to_destination_timezone(time_in_origin_timezone: str, time_difference_hours: int):
@@ -557,3 +697,77 @@ def save_preference(key: str, value: str) -> str:
     value: the preference value (e.g. 'El Al', 'kosher', 'luxury')
     """
     return f"saved:{key}={value}"
+
+@tool
+def fetch_restaurants(city: str):
+    """
+    Fetch recommended restaurants in a city.
+    Use this tool for restaurant, food, cuisine, romantic dinner, cheap food, local food, or fine dining requests.
+    returns a list of restaurants with their cuisine type, price level, rating, and any special features (e.g. vegan options, outdoor seating).
+    """
+
+    query = """
+    SELECT name, cuisine, price_level, rating, special_features
+    FROM restaurants
+    WHERE LOWER(city) = ?
+    """
+
+    params = [city.strip().lower()]
+    matches = _run_query(query, tuple(params))
+
+    if not matches or isinstance(matches, str):
+        return f"No restaurants found in {city}."
+
+    return matches
+
+@tool
+def fetch_beaches(city: str = None):
+    """
+    Fetch beach recommendations.
+    Use this tool for beach, swimming, sunbathing, nightlife near beach, family beach, or water sports requests.
+    If city is not provided, search beaches across all cities.
+    returns a list of beaches with their type (sandy, rocky, pebbly), suitability (family-friendly, good for parties, water sports), and any special notes (e.g. lifeguards on duty, nearby amenities).
+    """
+
+    query = """
+    SELECT city, beach_name, beach_type, suitable_for, notes
+    FROM beaches
+    WHERE 1=1
+    """
+
+    params = []
+
+    if city is not None:
+        query += " AND LOWER(city) = ?"
+        params.append(city.strip().lower())
+
+
+    matches = _run_query(query, tuple(params))
+
+    if not matches or isinstance(matches, str):
+        return "No beach recommendations found."
+
+    return matches
+
+@tool
+def fetch_city_transport_info(city: str):
+    """
+    Get basic city transportation info.
+    Use only for public transport, metro, subway, buses, or getting around a city.
+    Do not use for rental cars.
+    """
+
+    query = """
+    SELECT transport_type, average_ticket_price, car_needed, notes
+    FROM public_transport
+    WHERE LOWER(city) = ?
+    """
+
+    city_param = city.strip().lower()
+
+    matches = _run_query(query, (city_param,))
+
+    if not matches or isinstance(matches, str):
+        return f"No public transport information found for {city}."
+
+    return matches
