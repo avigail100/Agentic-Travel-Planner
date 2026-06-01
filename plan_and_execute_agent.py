@@ -51,7 +51,12 @@ from tools import (
     lookup_location_options,
     save_preference,
     search_web,
-    suggest_alternatives
+    suggest_alternatives,
+    find_hotels_by_amenity,
+    find_destinations_by_preference,
+    fetch_restaurants,
+    fetch_beaches,
+    fetch_city_transport_info,
 )
 
 load_dotenv()
@@ -121,7 +126,9 @@ tools = [
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
     fetch_seasonal_recommendations, convert_time_to_destination_timezone,
     lookup_location_options, find_connecting_flights,
-    save_preference, suggest_alternatives, search_web
+    save_preference, suggest_alternatives, search_web,
+    find_hotels_by_amenity, find_destinations_by_preference, fetch_restaurants,
+    fetch_beaches, fetch_city_transport_info,
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
@@ -390,6 +397,9 @@ After executing the step, provide a brief text summary of what you found.
 When the current step asks to fetch flights/hotels/activities, location lookup is only a preparation step.
 After lookup_location_options returns a valid match, you MUST call the requested fetch tool in the same step.
 Do not stop after lookup unless there is NO_MATCH.
+Before calling lookup_location_options, check the "Already completed" section.
+If the same location was already resolved successfully earlier in this run, do NOT call lookup_location_options again.
+Reuse the resolved location directly in the target fetch tool.
 """
 
 
@@ -518,6 +528,13 @@ def after_tools(state: PlanExecuteState):
             step_tool_msgs.append(m)
     step_tool_msgs.reverse()
 
+    called_tools = {m.name for m in step_tool_msgs}
+
+    did_lookup = "lookup_location_options" in called_tools
+    only_lookup_done = called_tools == {"lookup_location_options"}
+
+    advance_plan = not only_lookup_done
+
     new_cost = _extract_cost(tool_msgs)
     total_cost = state.get("calculated_total", 0.0) + new_cost
 
@@ -530,9 +547,6 @@ def after_tools(state: PlanExecuteState):
 
     for m in step_tool_msgs:
         print(f"      ✓ {m.name}: {_digest_tool_result(m.content)}")
-    last_tool_name = step_tool_msgs[-1].name if step_tool_msgs else None
-
-    advance_plan = last_tool_name != "lookup_location_options"
 
     return {
         "past_steps": state.get("past_steps", []) + [step_record],
