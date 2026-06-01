@@ -125,17 +125,18 @@ tools = [
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
+#_base_model = ChatGroq(
+#    api_key=os.getenv("GROQ_API_KEY"),
+#    model="llama-3.3-70b-versatile", 
+#    temperature=0.4,
+#    max_retries=1
+#)
 
 planner_model   = _base_model.with_structured_output(Plan)
 replanner_model = _base_model.with_structured_output(ReplanAction)
 executor_model  = _base_model.bind_tools(tools)
 
-# _base_model = ChatGroq(
-#     api_key=os.getenv("GROQ_API_KEY"),
-#     model="llama-3.3-70b-versatile", 
-#     temperature=0.4,
-#     max_retries=1
-# )
+
 
 # # Keep these exactly as they are! They will now automatically use Groq:
 # planner_model   = _base_model.with_structured_output(Plan)
@@ -261,6 +262,9 @@ CRITICAL RULES FOR PLANNING:
    - Example: You must gather all trip components (flights, hotels) in early steps BEFORE adding a final step to "Calculate total trip cost".
 5. Do Not use all the available tools just for the sake of it. Only include tools that are relevant to the user's request. Irrelevant steps waste time and risk hitting token limits.
 6. Simplicity: Maximum 6 steps. Keep step descriptions concise and focused on the data needed. Do not plan formatting or summarization steps (the system handles the final output automatically).
+
+Do NOT create separate lookup_location_options steps.
+The Executor will do lookup automatically.
 """
 
 
@@ -383,6 +387,9 @@ weather, news/advisories, special events):
   ANSWER line, summarise the snippets — do NOT fabricate a number.
 
 After executing the step, provide a brief text summary of what you found.
+When the current step asks to fetch flights/hotels/activities, location lookup is only a preparation step.
+After lookup_location_options returns a valid match, you MUST call the requested fetch tool in the same step.
+Do not stop after lookup unless there is NO_MATCH.
 """
 
 
@@ -443,23 +450,23 @@ def execute_node(state: PlanExecuteState):
         # -------------------------------------------------------------------------
         #  INFINITE LOOP GUARD: Check if the model generated an identical tool call
         # -------------------------------------------------------------------------
-        if hasattr(response, "tool_calls") and response.tool_calls:
-            for tc in response.tool_calls:
-                print(f"    → calling {_format_call(tc)}")
-            for tc in response.tool_calls:
-                args_str = json.dumps(tc.get("args", {}), sort_keys=True)
-                current_call = (tc.get("name"), args_str)
+        # if hasattr(response, "tool_calls") and response.tool_calls:
+        #     for tc in response.tool_calls:
+        #         print(f"    → calling {_format_call(tc)}")
+        #     for tc in response.tool_calls:
+        #         args_str = json.dumps(tc.get("args", {}), sort_keys=True)
+        #         current_call = (tc.get("name"), args_str)
                 
-                # If the exact same tool with the exact same arguments was called before:
-                if current_call in past_tool_calls:
-                    loop_error = f"[ERROR] Infinite loop detected. The tool '{tc.get('name')}' was called again with the exact same arguments: {args_str}."
-                    print(f"\n[Loop Guard] Aborting execution to prevent API quota drain.\n {loop_error}")
+        #         # If the exact same tool with the exact same arguments was called before:
+        #         if current_call in past_tool_calls:
+        #             loop_error = f"[ERROR] Infinite loop detected. The tool '{tc.get('name')}' was called again with the exact same arguments: {args_str}."
+        #             print(f"\n[Loop Guard] Aborting execution to prevent API quota drain.\n {loop_error}")
                     
-                    return {
-                        "messages": [AIMessage(content=loop_error)],
-                        "plan": [],   # Clear the plan to force Replanner to handle the failure
-                        "response": "I encountered an issue searching for this specific combination repeatedly. Please try adjusting your destination or origin specifications.",
-                    }
+        #             return {
+        #                 "messages": [AIMessage(content=loop_error)],
+        #                 "plan": [],   # Clear the plan to force Replanner to handle the failure
+        #                 "response": "I encountered an issue searching for this specific combination repeatedly. Please try adjusting your destination or origin specifications.",
+        #             }
         # -------------------------------------------------------------------------
         
     except Exception as e:
@@ -523,9 +530,13 @@ def after_tools(state: PlanExecuteState):
 
     for m in step_tool_msgs:
         print(f"      ✓ {m.name}: {_digest_tool_result(m.content)}")
+    last_tool_name = step_tool_msgs[-1].name if step_tool_msgs else None
+
+    advance_plan = last_tool_name != "lookup_location_options"
+
     return {
         "past_steps": state.get("past_steps", []) + [step_record],
-        "plan": state["plan"][1:],   # advance to the next step
+        "plan": state["plan"][1:] if advance_plan else state["plan"],
         "calculated_total": total_cost,
         "user_preferences": existing_prefs,
     }
