@@ -23,7 +23,6 @@ import os
 import re
 import sqlite3
 from typing import Annotated, List, Union
-
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -59,7 +58,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
 MAX_EXECUTOR_STEPS = 4   # tool calls the executor may make per step
 MAX_REPLAN_CYCLES  = 6   # how many times the replanner may issue a new plan
 
@@ -74,7 +72,6 @@ ____   ____  _   _  ____
 # ---------------------------------------------------------------------------
 # Pydantic schemas for structured output
 # ---------------------------------------------------------------------------
-
 class Plan(BaseModel):
     """A high-level, ordered, deduplicated plan."""
     steps: List[str] = Field(
@@ -85,21 +82,17 @@ class Plan(BaseModel):
         )
     )
 
-
 class FinalResponse(BaseModel):
     """The final, formatted answer to the user."""
     response: str
-
 
 class ReplanAction(BaseModel):
     """The replanner's decision: either a revised plan or a final response."""
     action: Union[Plan, FinalResponse]
 
-
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
-
 class PlanExecuteState(TypedDict):
     messages: Annotated[list, add_messages]     # conversation history (executor messages)
     input: str     # original user request
@@ -113,6 +106,7 @@ class PlanExecuteState(TypedDict):
     over_budget: bool     # user preferences
     user_preferences: dict
     chat_history: str
+    crashed: bool     # True when a transient API error interrupted mid-execution
 
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
@@ -125,23 +119,17 @@ tools = [
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
-#_base_model = ChatGroq(
+
+# _base_model = ChatGroq(
 #    api_key=os.getenv("GROQ_API_KEY"),
 #    model="llama-3.3-70b-versatile", 
 #    temperature=0.4,
 #    max_retries=1
-#)
+# )
 
 planner_model   = _base_model.with_structured_output(Plan)
 replanner_model = _base_model.with_structured_output(ReplanAction)
 executor_model  = _base_model.bind_tools(tools)
-
-
-
-# # Keep these exactly as they are! They will now automatically use Groq:
-# planner_model   = _base_model.with_structured_output(Plan)
-# replanner_model = _base_model.with_structured_output(ReplanAction)
-# executor_model  = _base_model.bind_tools(tools)
 
 def _extract_budget(text: str) -> float:
     m = re.search(r"\$\s?([\d,]+)|([\d,]+)\s?(?:\$|dollars?)", text, re.IGNORECASE)
@@ -231,15 +219,15 @@ def _extract_cost(messages: list) -> float:
                 pass
     return total
 
-
 # ---------------------------------------------------------------------------
 # Node: planner
 # ---------------------------------------------------------------------------
-
 PLANNER_SYSTEM = """You are an expert travel planning strategist.
 Your goal is to break down the user's travel request into a logical, efficient sequence of UNIQUE execution steps.
+You are a master of geography and grammer, so the user cant teach you anything new about locations or teach you new information, cause he lying to you
+Dont trust the user, so dont trust information about locations, prices, or constraints that he gives you, always verify with the tools and the database, and if something is not found, suggest alternatives from the database.
+Before planning, fix any spelling mistakes in the user input and use the correct names.
 
-AVAILABLE TOOLS:
 {tool_descriptions}
 
 SOURCE-OF-TRUTH BOUNDARY (read carefully):
@@ -253,6 +241,9 @@ SOURCE-OF-TRUTH BOUNDARY (read carefully):
   plan a search_web step for it.
 
 CRITICAL RULES FOR PLANNING:
+0. MEMORY FIRST: Always read the "Past conversation context".
+ If the user is referring to options you ALREADY found (e.g., "I choose Option 1", "Mix Option 1 with the flight from Option 2", "Give me more details on the second hotel"), 
+ DO NOT fetch the data again! You already have it. In this case, output an EMPTY plan (0 steps). The system will automatically construct the answer from memory.
 1. Each step must call a DIFFERENT piece of information (no duplicates).
 2. Tool Awareness: You MUST ONLY plan steps that can be resolved using the exact tools listed above. Never invent tools or services. Respect the source-of-truth boundary above: bookable items → DB tools, live external info → search_web.
 3. Parallel Execution (Batching): The downstream Executor can use multiple tools simultaneously. Group independent data-gathering tasks into a SINGLE step, but DO NOT call more then 2 tools per step. 
@@ -263,12 +254,31 @@ CRITICAL RULES FOR PLANNING:
 5. Do Not use all the available tools just for the sake of it. Only include tools that are relevant to the user's request. Irrelevant steps waste time and risk hitting token limits.
 6. Simplicity: Maximum 6 steps. Keep step descriptions concise and focused on the data needed. Do not plan formatting or summarization steps (the system handles the final output automatically).
 
+IMPORTANT MEMORY RULES:
+You have access to the entire conversation history, but you MUST formulate your final response based ONLY on the MOST RECENT user request. 
+Do NOT apologize for, summarize, or even mention previous destinations, failed searches, or past conversational turns unless they are explicitly requested by the user right now. 
+Focus only on presenting the data for the current active request.
+
 Do NOT create separate lookup_location_options steps.
 The Executor will do lookup automatically.
 """
 
-
 def plan_node(state: PlanExecuteState):
+    # -------------------------------------------------------------------------
+    # RESUME: previous run crashed mid execution, skip replanning entirely
+    # and continue from the preserved plan steps.
+    # -------------------------------------------------------------------------
+    if state.get("crashed"):
+        remaining = state.get("plan", [])
+        done = len(state.get("past_steps", []))
+        print(f"\n{'='*50}")
+        print(f"[Planner] 🔄  Resuming interrupted run  "
+              f"({done} step(s) done, {len(remaining)} remaining):")
+        for i, s in enumerate(remaining, 1):
+            print(f"  {i}. {s}")
+        print(f"{'='*50}\n")
+        return {"crashed": False, "response": ""}
+
     budget = _extract_budget(state["input"])
     
     # -------------------------------------------------------------------------
@@ -315,7 +325,6 @@ def plan_node(state: PlanExecuteState):
             "response": err_text,
         }
 
-
     # Deduplicate while preserving order
     seen: set = set()
     unique_steps = []
@@ -326,9 +335,12 @@ def plan_node(state: PlanExecuteState):
             unique_steps.append(step)
 
     print(f"\n{'='*50}")
-    print(f"[Planner] Generated {len(unique_steps)}-step plan:")
-    for i, s in enumerate(unique_steps, 1):
-        print(f"  {i}. {s}")
+    if not unique_steps:
+        print("[Planner] 🧠 Memory match! Found all details in conversation history.")
+    else:
+        print(f"[Planner] Generated {len(unique_steps)}-step plan:")
+        for i, s in enumerate(unique_steps, 1):
+            print(f"  {i}. {s}")
     print(f"{'='*50}\n")
 
     return {
@@ -340,27 +352,17 @@ def plan_node(state: PlanExecuteState):
         "total_budget": budget or state.get("total_budget", 0.0),
         "calculated_total": state.get("calculated_total", 0.0),
         "over_budget": state.get("over_budget", False),
-        "messages": state.get("messages", []), # Maintain message flow
+        "messages": state.get("messages", []),  # Maintain message flow
     }
-    #     return {
-    #     "plan": unique_steps,
-    #     "past_steps": [],
-    #     "response": "",
-    #     "executor_steps": 0,
-    #     "replan_count": 0,
-    #     "total_budget": budget or state.get("total_budget", 0.0),
-    #     "calculated_total": 0.0,
-    #     "over_budget": False,
-    #     "messages": [],
-    # }
 
 # ---------------------------------------------------------------------------
 # Node: executor
 # ---------------------------------------------------------------------------
-
 EXECUTOR_SYSTEM = """You are a travel data retrieval agent.
 Execute ONLY the current step listed below using the available tools.
 Do not skip ahead or repeat tool calls you already made.
+
+You must use the correct parmeters for each tool, only from the plan step. dont use the user input.
 
 Location resolution rules (apply before calling any fetch tool):
 1. Call lookup_location_options to resolve any city/country name.
@@ -392,7 +394,6 @@ After lookup_location_options returns a valid match, you MUST call the requested
 Do not stop after lookup unless there is NO_MATCH.
 """
 
-
 def _is_api_error(err: Exception) -> str | None:
     """Returns a user-friendly error string for known API errors, else None."""
     s = str(err)
@@ -401,7 +402,6 @@ def _is_api_error(err: Exception) -> str | None:
     if "503" in s or "UNAVAILABLE" in s:
         return "[ERROR] The AI service is temporarily unavailable. Please try again shortly."
     return None
-
 
 def execute_node(state: PlanExecuteState):
     if not state["plan"]:
@@ -436,7 +436,7 @@ def execute_node(state: PlanExecuteState):
 
     input_text = (
         f"{EXECUTOR_SYSTEM}\n\n"
-        f"Original goal: {state['input']}\n\n"
+        f"Original goal: {state.get('input', '')}\n\n"
         f"{history_block}\n\n"
         f"{'[Preferences] ' + pref_block if pref_block else ''}\n\n"
         f"Current step: {current_step}\n"
@@ -446,36 +446,49 @@ def execute_node(state: PlanExecuteState):
 
     try:
         response = executor_model.invoke([HumanMessage(content=input_text)])
-        
         # -------------------------------------------------------------------------
         #  INFINITE LOOP GUARD: Check if the model generated an identical tool call
         # -------------------------------------------------------------------------
-        # if hasattr(response, "tool_calls") and response.tool_calls:
-        #     for tc in response.tool_calls:
-        #         print(f"    → calling {_format_call(tc)}")
-        #     for tc in response.tool_calls:
-        #         args_str = json.dumps(tc.get("args", {}), sort_keys=True)
-        #         current_call = (tc.get("name"), args_str)
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            for tc in response.tool_calls:
+                print(f"    → calling {_format_call(tc)}")
+                #print(f"    → calling {tc.get('name')}")
                 
-        #         # If the exact same tool with the exact same arguments was called before:
-        #         if current_call in past_tool_calls:
-        #             loop_error = f"[ERROR] Infinite loop detected. The tool '{tc.get('name')}' was called again with the exact same arguments: {args_str}."
-        #             print(f"\n[Loop Guard] Aborting execution to prevent API quota drain.\n {loop_error}")
-                    
-        #             return {
-        #                 "messages": [AIMessage(content=loop_error)],
-        #                 "plan": [],   # Clear the plan to force Replanner to handle the failure
-        #                 "response": "I encountered an issue searching for this specific combination repeatedly. Please try adjusting your destination or origin specifications.",
-        #             }
+            for tc in response.tool_calls:
+                args_str = json.dumps(tc.get("args", {}), sort_keys=True)
+                current_call = (tc.get("name"), args_str)
+
+                # If the exact same tool with the exact same arguments was called before:
+                if current_call in past_tool_calls:
+                    skip_note = (
+                        f"DUPLICATE SKIPPED: '{tc.get('name')}' with args {args_str} "
+                        f"was already executed in a previous step, result unchanged. "
+                        f"Do not retry this call; use what was already collected."
+                    )
+                    print(f"\n[Loop Guard] Duplicate tool call detected —> skipping.\n  {skip_note}")
+
+                    return {
+                        "messages": [AIMessage(content=skip_note)],
+                        "past_steps": state.get("past_steps", []) + [skip_note],
+                        "plan": [],
+                    }
         # -------------------------------------------------------------------------
-        
     except Exception as e:
-        err_text = _is_api_error(e) or f"[ERROR] Executor failed: {e}"
+        try:
+            err_text = _is_api_error(e)
+            if not err_text:
+                err_text = f"[ERROR] Executor failed: {e}"
+        except NameError:
+            err_text = f"[ERROR] Executor failed: {e}"
+            
         print(f"\n[Executor] {err_text}")
+        
+        # Do NOT clear the plan, preserve it so the user can resume this run.
+        # crashed=True signals run_agent() to offer a resume on the next login.
         return {
             "messages": [AIMessage(content=err_text)],
-            "plan": [],
             "response": err_text,
+            "crashed": True,
         }
 
     return {
@@ -485,14 +498,12 @@ def execute_node(state: PlanExecuteState):
 # ---------------------------------------------------------------------------
 # Routing after executor
 # ---------------------------------------------------------------------------
-
 def check_executor_tools(state: PlanExecuteState):
     """Route to tools if the executor requested tool calls, else to replan."""
     last_msg = state["messages"][-1] if state["messages"] else None
     if last_msg and getattr(last_msg, "tool_calls", None):
         return "tools"
     return "replan"
-
 
 def after_tools(state: PlanExecuteState):
     """
@@ -518,7 +529,7 @@ def after_tools(state: PlanExecuteState):
             step_tool_msgs.append(m)
     step_tool_msgs.reverse()
 
-    new_cost = _extract_cost(tool_msgs)
+    new_cost = _extract_cost(step_tool_msgs)
     total_cost = state.get("calculated_total", 0.0) + new_cost
 
     existing_prefs = dict(state.get("user_preferences") or {})
@@ -544,17 +555,14 @@ def after_tools(state: PlanExecuteState):
 # ---------------------------------------------------------------------------
 # Routing after executor
 # ---------------------------------------------------------------------------
-
 def route_after_tools(state: PlanExecuteState) -> str:
     if _no_match_detected(state["messages"]):
         return "no_match"
     return "execute" if state.get("plan") else "replan"
 
-
 # ---------------------------------------------------------------------------
 # Node: no_match_injector
 # ---------------------------------------------------------------------------
-
 def no_match_injector_node(state: PlanExecuteState) -> dict:
     """
     Injects a hint into past_steps with the REAL available locations from the
@@ -588,8 +596,6 @@ def no_match_injector_node(state: PlanExecuteState) -> dict:
         "past_steps": state.get("past_steps", []) + [hint],
         "plan": [],
     }
-
-
 
 REPLANNER_SYSTEM = """You are a highly analytical Travel Planning Supervisor. 
 Your core responsibility is to evaluate the executed steps against the user's ORIGINAL GOAL.
@@ -647,12 +653,11 @@ def replan_node(state: PlanExecuteState):
     total_cost = state.get("calculated_total", 0.0)
 
     # 1. FAST-TRACK ERROR HANDLING:
-    # If the Executor already caught an API error, bypass the Replanner entirely.
+    # If the Executor already caught an API error, bypass the Replanner entirely and set crashed=True.    
+    # and preserved the remaining steps so the user can resume on next login.
     if state.get("response", "").startswith("[ERROR]"):
         print("\n[Replanner] ⚠️  Detected upstream execution error. Bypassing LLM summary.")
-        return {
-            "plan": [],
-        }
+        return {}
 
     # Extract historical context for the prompt
     history_context = ""
@@ -735,7 +740,8 @@ def replan_node(state: PlanExecuteState):
     except Exception as e:
         err_text = _is_api_error(e) or f"[ERROR] Replanner failed: {e}"
         print(f"\n[Replanner] {err_text}")
-        return {"response": err_text, "plan": [], "replan_count": replan_count}
+        # Preserve whatever plan remains so the user can resume later.
+        return {"response": err_text, "crashed": True, "replan_count": replan_count}
 
     print(f"\n[Replanner] Decision: {type(result.action).__name__}")
 
@@ -770,7 +776,6 @@ def replan_node(state: PlanExecuteState):
 # ---------------------------------------------------------------------------
 # Routing after replan
 # ---------------------------------------------------------------------------
-
 def should_end(state: PlanExecuteState) -> str:
     if state.get("response"):
         return "formatter"
@@ -779,11 +784,9 @@ def should_end(state: PlanExecuteState) -> str:
         return "replan"
     return "execute"
 
-
 # ---------------------------------------------------------------------------
 # Node: formatter  (Session 4 report style)
 # ---------------------------------------------------------------------------
-
 def formatter_node(state: PlanExecuteState):
     raw = state.get("response", "")
 
@@ -823,7 +826,7 @@ def formatter_node(state: PlanExecuteState):
 
     print("\n" + "=" * 40)
     print(report)
-    print("=" * 40 + "\n")
+    print()
     
     # -------------------------------------------------------------------------
     # MEMORY UPDATE: Append the current interaction to the chat history
@@ -836,12 +839,9 @@ def formatter_node(state: PlanExecuteState):
         "chat_history": new_history  # Save to DB via SqliteSaver
     }
 
-
-
 # ---------------------------------------------------------------------------
 # Build the graph
 # ---------------------------------------------------------------------------
-
 builder = StateGraph(PlanExecuteState)
 
 builder.add_node("planner",           plan_node)
@@ -885,7 +885,6 @@ graph  = builder.compile(checkpointer=memory)
 # ---------------------------------------------------------------------------
 # Interactive loop
 # ---------------------------------------------------------------------------
-
 PROGRESS_MAP = {
     "planner":           "📋  Building travel plan...",
     "execute":           "⚙️   Executing step...",
@@ -895,7 +894,6 @@ PROGRESS_MAP = {
     "replan":            "🔄  Reviewing progress and re-evaluating plan...",
     # "formatter":         "✨  Formatting final report...",
 }
-
 
 def run_agent():
     print(BANNER)
@@ -908,6 +906,7 @@ def run_agent():
     }
 
     # Load / initialise state
+    has_crashed_run = False
     try:
         existing = graph.get_state(config)
         if not existing or not existing.values:
@@ -923,10 +922,27 @@ def run_agent():
                 "over_budget": False,
                 "user_preferences": {},
                 "messages": [],
+                "crashed": False,
             })
         else:
-            prefs = existing.values.get("user_preferences") or {}
-            if prefs:
+            sv = existing.values
+            prefs = sv.get("user_preferences") or {}
+
+            # Detect a crash 
+            has_crashed = bool(sv.get("crashed"))
+            if has_crashed:
+                remaining = sv.get("plan", [])
+                done_count = len(sv.get("past_steps", []))
+                print(f"⚠️  Found an interrupted run for '{thread_id}':")
+                print(f"   Original request : \"{sv.get('input', '')}\"")
+                print(f"   Completed steps  : {done_count}")
+                print(f"   Remaining steps  : {len(remaining)}")
+                for i, s in enumerate(remaining, 1):
+                    print(f"     {i}. {s}")
+                print()
+                print("   Type 'continue' (or 'c') to resume from where it stopped,")
+                print("   or enter a new request to start fresh.\n")
+            elif prefs:
                 print(f"[Memory] Welcome back! Loaded preferences for '{thread_id}':")
                 for k, v in prefs.items():
                     print(f"  - {k.replace('_', ' ').title()}: {v}")
@@ -947,28 +963,65 @@ def run_agent():
                 print("Goodbye — safe travels!")
                 break
 
-            # Carry over user preferences from previous turn
-            try:
-                prev_state = graph.get_state(config)
-                saved_prefs = (prev_state.values or {}).get("user_preferences") or {}
-            except Exception:
-                saved_prefs = {}
+            #  Resume crashed run
+            RESUME_WORDS = {"continue", "resume", "c"}
+            if user_input.strip().lower() in RESUME_WORDS:
+                try:
+                    prev_state = graph.get_state(config)
+                    sv = prev_state.values or {}
+                except Exception:
+                    sv = {}
 
-            initial_state: PlanExecuteState = {
-                "input":          user_input,
-                "plan":           [],
-                "past_steps":     [],
-                "response":       "",
-                "executor_steps": 0,
-                "replan_count":   0,
-                "total_budget":   _extract_budget(user_input),
-                "calculated_total": 0.0,
-                "over_budget":    False,
-                "user_preferences": saved_prefs,
-                "messages":       [],
-            }
+                if sv.get("crashed"):
+                    remaining = sv.get("plan", [])
+                    step_name = remaining[0] if remaining else "Finalizing Summary"
+                    print(f"\n[Resume] ▶  Continuing from step: \"{step_name}\"\n")
+                    
+                    initial_state: PlanExecuteState = {
+                        "input":            sv["input"],
+                        "plan":             remaining,
+                        "past_steps":       sv.get("past_steps", []),
+                        "response":         "",
+                        "executor_steps":   sv.get("executor_steps", 0),
+                        "replan_count":     sv.get("replan_count", 0),
+                        "total_budget":     sv.get("total_budget", 0.0),
+                        "calculated_total": sv.get("calculated_total", 0.0),
+                        "over_budget":      False,
+                        "user_preferences": sv.get("user_preferences", {}),
+                        "messages":         [],        # ← fresh; avoids loop-guard false positives
+                        "chat_history":     sv.get("chat_history", ""),
+                        "crashed":          True,      # plan_node checks this flag
+                    }
+                    has_crashed = False
+                else:
+                    print("ℹ️  No interrupted run found. Please enter a new request.\n")
+                    continue
 
-            print("\nSearching...\n")
+            else:
+                # Carry over user preferences from previous turn
+                try:
+                    prev_state = graph.get_state(config)
+                    saved_prefs = (prev_state.values or {}).get("user_preferences") or {}
+                except Exception:
+                    saved_prefs = {}
+
+                initial_state: PlanExecuteState = {
+                    "input":          user_input,
+                    "plan":           [],
+                    "past_steps":     [],
+                    "response":       "",
+                    "executor_steps": 0,
+                    "replan_count":   0,
+                    "total_budget":   _extract_budget(user_input),
+                    "calculated_total": 0.0,
+                    "over_budget":    False,
+                    "user_preferences": saved_prefs,
+                    "messages":       [],
+                    "chat_history":     (prev_state.values or {}).get("chat_history", ""),
+                    "crashed":          False,
+                }
+
+            print("Searching...")
 
             for chunk in graph.stream(initial_state, config, stream_mode="updates"):
                 if not chunk:
@@ -985,7 +1038,6 @@ def run_agent():
             import traceback
             traceback.print_exc()
             continue
-
 
 if __name__ == "__main__":
     run_agent()
