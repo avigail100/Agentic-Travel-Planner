@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Travel Agent — Plan-and-Execute Architecture (Session 5)
+Travel Agent — Plan-and-Execute Architecture (Session 6)
 
 Architecture:
-  planner  →  execute  ⇄  tools  →  replan  → (loop or END)
+  planner  →  execute  ⇄  tools  ⇄   replan  ⇄  critic → formatter → END
 
 - Planner:  produces a deduplicated, ordered list of steps (Pydantic-validated)
 - Executor: runs one step at a time using all travel tools (ReAct style)
@@ -67,6 +67,7 @@ load_dotenv()
 
 MAX_EXECUTOR_STEPS = 4   # tool calls the executor may make per step
 MAX_REPLAN_CYCLES  = 6   # how many times the replanner may issue a new plan
+MAX_CRITIC_CYCLES  = 2   # how many times the critic may send the agent back for fixes
 
 BANNER = r"""
 ____   ____  _   _  ____
@@ -101,6 +102,25 @@ class ReplanAction(BaseModel):
     action: Union[Plan, FinalResponse]
 
 
+class CriticResult(BaseModel):
+    """The critic's decision for Reflection / Reflexion-style review."""
+    passed: bool = Field(
+        description="True only if the draft answer satisfies the original user request."
+    )
+    issues: List[str] = Field(
+        default_factory=list,
+        description="Concrete problems found in the draft answer."
+    )
+    fix_steps: List[str] = Field(
+        default_factory=list,
+        description="Concrete execution steps needed to fix the answer. Keep them tool-friendly."
+    )
+    reflection: str = Field(
+        default="",
+        description="One short lesson from this failed attempt, used as memory for the next attempt."
+    )
+
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -118,6 +138,9 @@ class PlanExecuteState(TypedDict):
     over_budget: bool     # user preferences
     user_preferences: dict
     chat_history: str
+    reflection_memory: List[str]
+    critic_passed: bool
+    critic_count: int
 
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
@@ -132,15 +155,11 @@ tools = [
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
-#_base_model = ChatGroq(
-#    api_key=os.getenv("GROQ_API_KEY"),
-#    model="llama-3.3-70b-versatile", 
-#    temperature=0.4,
-#    max_retries=1
-#)
+#_base_model = ChatGroq( api_key=os.getenv("GROQ_API_KEY"), model="llama-3.3-70b-versatile", temperature=0.4,max_retries=1)
 
 planner_model   = _base_model.with_structured_output(Plan)
 replanner_model = _base_model.with_structured_output(ReplanAction)
+critic_model    = _base_model.with_structured_output(CriticResult)
 executor_model  = _base_model.bind_tools(tools)
 
 
@@ -270,6 +289,9 @@ CRITICAL RULES FOR PLANNING:
 5. Do Not use all the available tools just for the sake of it. Only include tools that are relevant to the user's request. Irrelevant steps waste time and risk hitting token limits.
 6. Simplicity: Maximum 6 steps. Keep step descriptions concise and focused on the data needed. Do not plan formatting or summarization steps (the system handles the final output automatically).
 
+- Always include a step: "Check travel warnings for [destination] using search_web with category=news"
+- Place this step early, before the final cost calculation.
+
 Do NOT create separate lookup_location_options steps.
 The Executor will do lookup automatically.
 """
@@ -348,6 +370,9 @@ def plan_node(state: PlanExecuteState):
         "calculated_total": state.get("calculated_total", 0.0),
         "over_budget": state.get("over_budget", False),
         "messages": state.get("messages", []), # Maintain message flow
+        "reflection_memory": [],
+        "critic_passed": False,
+        "critic_count": 0,
     }
     #     return {
     #     "plan": unique_steps,
@@ -440,8 +465,15 @@ def execute_node(state: PlanExecuteState):
 
     history_block = ""
     if state.get("past_steps"):
-        history_block = "Already completed:\n" + "\n".join(
+        history_block = "Already completed / tool results so far:\n" + "\n".join(
             f"  - {s}" for s in state["past_steps"]
+        )
+
+    reflection_block = ""
+    if state.get("reflection_memory"):
+        reflection_block = (
+            "Reflection memory from previous failed attempts in this same task:\n"
+            + "\n".join(f"- {m}" for m in state["reflection_memory"] if m)
         )
 
     input_text = (
@@ -449,6 +481,7 @@ def execute_node(state: PlanExecuteState):
         f"Original goal: {state['input']}\n\n"
         f"{history_block}\n\n"
         f"{'[Preferences] ' + pref_block if pref_block else ''}\n\n"
+        f"{reflection_block}\n\n"
         f"Current step: {current_step}\n"
     )
 
@@ -646,6 +679,7 @@ When relaxing constraints or suggesting new destinations, you MUST base your str
 
 DECISION ACTIONS:
 A) Action: FinalResponse
+   - Use if reflection memory says the previous draft answer was incomplete, but the required data already exists in completed steps. In that case, do NOT create a new Plan. Regenerate a better FinalResponse using the completed tool results and reflection memory.
    - Use if the original goal is fully met.
    - Use if you successfully found alternatives after relaxing constraints. CRITICAL: You MUST explicitly and clearly state to the user which original constraint was broken (e.g., "I couldn't find a 5-star hotel under $500, but I found this highly-rated option for $800" or "Direct flights were unavailable, so I found an alternative with a connection").
    - Use if you have exhausted all relaxed searches and absolutely nothing is available.
@@ -734,10 +768,19 @@ def replan_node(state: PlanExecuteState):
     )
     tool_descriptions = "\n".join([f"- {t.name}: {t.description.splitlines()[0]}" for t in tools])
 
+    reflection_block = ""
+    if state.get("reflection_memory"):
+        reflection_block = (
+            "Reflection memory from previous failed attempts in this same task:\n"
+            + "\n".join(f"- {m}" for m in state["reflection_memory"] if m)
+        )
+
     prompt = (
-        REPLANNER_SYSTEM.format(tool_descriptions=tool_descriptions) + "\n\n"        f"{history_context}\n\n"
+        REPLANNER_SYSTEM.format(tool_descriptions=tool_descriptions) + "\n\n"
+        f"{history_context}\n\n"
         f"Original goal: {state['input']}\n\n"
         f"Completed steps:\n{past_steps_text}\n\n"
+        f"{reflection_block}\n\n"
         f"Remaining planned steps:\n{remaining_text}\n\n"
         f"{budget_note}\n\n"
         "What should happen next? Evaluate carefully and choose the correct action schema."
@@ -758,8 +801,23 @@ def replan_node(state: PlanExecuteState):
         budget_warn = ""
         if budget > 0 and total_cost > budget:
             budget_warn = f"\n\n⚠️  BUDGET ALERT: Estimated ${total_cost:.2f} exceeds your ${budget:.2f} limit."
+
+        final_text = result.action.response + budget_warn
+
+        # TEST ONLY: create an incomplete draft once, so the Critic can catch it.
+        # This simulates a bad final draft while keeping the collected tool data valid.
+        if (
+            "critic_demo" in state["input"].lower()
+            and state.get("critic_count", 0) == 0
+        ):
+            print("[TEST] Creating incomplete final draft for Critic demo.")
+            final_text = (
+                "I found flights for Paris, but I did not include the requested hotel "
+                "details or the safety information that was already collected."
+            )
+
         return {
-            "response": result.action.response + budget_warn,
+            "response": final_text,
             "plan": [],
             "replan_count": replan_count,
             "over_budget": budget > 0 and total_cost > budget,
@@ -792,6 +850,201 @@ def should_end(state: PlanExecuteState) -> str:
         # Plan is empty but no response yet — force replan to generate one
         return "replan"
     return "execute"
+
+# ---------------------------------------------------------------------------
+# Node: critic 
+# ---------------------------------------------------------------------------
+
+CRITIC_SYSTEM = """You are a Travel Plan Critic.
+
+Your job is to review the DRAFT final response before the user sees it.
+You are NOT an executor and you must NOT call tools directly.
+You must critique only using:
+1. The user's original request.
+2. The completed tool results in past_steps.
+3. The draft final response.
+
+Do NOT invent new requirements that are unrelated to the travel request.
+
+ASSIGNMENT FOCUS
+
+1. Destination suitability:
+- Verify that the selected destination matches the user's request.
+- Use the completed tool results as evidence, not only the wording of the final answer.
+- Examples of user constraints: warm destination, beach destination, family-friendly destination, specific destination, safe destination, travel warnings.
+- If the user requested a specific type of destination and there is no evidence that the selected destination matches it, fail.
+- If the selected destination contradicts the user's request, fail.
+
+2. Destination safety / travel warning:
+- Review the completed tool results for travel warnings, travel advisories, security alerts, elevated risk, unsafe destination, or similar wording.
+- If no safety search was performed at all for the selected/requested destination, fail and return this single data-gathering fix_step:
+  Search for travel warnings for the selected destination using search_web with category=news.
+- If the results explicitly mention a travel warning or elevated risk for the destination, fail unless the draft clearly warns the user about it.
+- If safety information exists and shows no warning, this criterion passes.
+
+3. Quality and style:
+- Verify that the final answer is professional, clear, and service-oriented.
+- Verify that the requested concrete details appear in the answer.
+- If the user requested flights, hotels, activities, restaurants, prices, or times, check that those details appear or that missing data is clearly explained.
+
+FIX STEP POLICY
+
+Choose the fix_step based on the type of problem:
+
+A. Missing data problem:
+- If the required information does NOT exist in completed tool results, return exactly ONE executable data-gathering step.
+- Examples: fetch_hotels in Paris, fetch_restaurants in Paris, search_web category=news for Paris travel warnings.
+
+B. Bad draft / missing-from-answer problem:
+- If the required information already EXISTS in completed tool results but is missing from the draft final response, do NOT request another fetch/search tool.
+- Return exactly this fix_step:
+  Regenerate the final answer using the completed tool results and reflection memory.
+
+OUTPUT RULES
+
+If the answer is acceptable:
+- passed = True
+- issues = []
+- fix_steps = []
+- reflection = ""
+
+If the answer is not acceptable:
+- passed = False
+- issues = specific problems
+- fix_steps = exactly ONE concrete step according to the FIX STEP POLICY
+- reflection = one short lesson for the next attempt
+
+Never return an empty fix_steps list when passed=False.
+"""
+
+def critic_node(state: PlanExecuteState):
+    critic_count = state.get("critic_count", 0) + 1
+
+    if critic_count > MAX_CRITIC_CYCLES:
+        print(f"\n[Critic] ⚠️  Critic limit reached — allowing final answer.")
+        return {
+            "critic_passed": True,
+            "critic_count": critic_count,
+        }
+
+    past_steps_text = "\n".join(state.get("past_steps", [])) or "(none)"
+    memory_text = "\n".join(
+        f"- {m}" for m in state.get("reflection_memory", []) if m
+    ) or "(none)"
+
+    prompt = (
+        f"{CRITIC_SYSTEM}\n\n"
+        f"Original user request:\n{state['input']}\n\n"
+        f"Completed tool/execution steps:\n{past_steps_text}\n\n"
+        f"Reflection memory so far:\n{memory_text}\n\n"
+        f"Draft final response:\n{state.get('response', '')}\n\n"
+        "Evaluate the draft answer now."
+    )
+
+    try:
+        result = critic_model.invoke(prompt)
+    except Exception as e:
+        if _is_api_error(e):
+            print("\n[Critic] ⚠️  Critic unavailable because of API quota — skipping review.")
+        else:
+            print(f"\n[Critic] [ERROR] Critic failed: {e}")
+        return {
+            "critic_passed": True,
+            "critic_count": critic_count,
+        }
+
+    print("\n[Critic] Decision:", "PASS ✅" if result.passed else "FAIL ❌")
+
+    if result.issues:
+        print("[Critic] Issues found:")
+        for issue in result.issues:
+            print(f"  - {issue}")
+
+    if result.passed:
+        return {
+            "critic_passed": True,
+            "critic_count": critic_count,
+        }
+
+    new_memory = list(state.get("reflection_memory", []))
+    if result.reflection:
+        new_memory.append(result.reflection)
+    elif result.issues:
+        new_memory.append("Previous attempt failed: " + "; ".join(result.issues))
+
+    clean_fix_steps = [s.strip() for s in result.fix_steps if s and s.strip()]
+
+    # Defensive fallback: the prompt says never empty, but keep the graph robust.
+    if not clean_fix_steps:
+        clean_fix_steps = [
+            "Collect the missing destination safety/suitability information using the appropriate available tool."
+        ]
+
+    # Keep only one step to avoid burning quota.
+    clean_fix_steps = clean_fix_steps[:1]
+
+    # If the model still returns a writing/editing instruction, convert it into
+    # a Replanner-friendly regeneration step instead of sending it to Executor.
+    writing_markers = ["add ", "update ", "include ", "mention ", "write ", "rewrite "]
+    if any(clean_fix_steps[0].lower().startswith(m) for m in writing_markers):
+        clean_fix_steps = [
+            "Regenerate the final answer using the completed tool results and reflection memory."
+        ]
+
+    print("[Critic] Reflection memory updated:")
+    for m in new_memory:
+        print(f"  - {m}")
+
+    print("[Critic] Sending agent back with fix step:")
+    print(f"  1. {clean_fix_steps[0]}")
+
+    return {
+        "critic_passed": False,
+        "critic_count": critic_count,
+        "reflection_memory": new_memory,
+        "plan": clean_fix_steps,
+        "response": "",
+    }
+
+
+def route_after_critic(state: PlanExecuteState) -> str:
+    if state.get("critic_passed"):
+        return "formatter"
+
+    plan = state.get("plan") or []
+    if not plan:
+        return "replan"
+
+    step = plan[0].lower()
+
+    # If the Critic says the data already exists and only the final answer
+    # needs regeneration, send back to the Replanner, not to the Executor.
+    regenerate_markers = [
+        "regenerate the final answer",
+        "completed tool results",
+        "reflection memory",
+    ]
+    if any(marker in step for marker in regenerate_markers):
+        return "replan"
+
+    # Data-gathering fix steps should go to the Executor.
+    executable_markers = [
+        "fetch_",
+        "fetch ",
+        "search_web",
+        "search for",
+        "check travel warnings",
+        "find_",
+        "find ",
+        "calculate",
+        "lookup",
+    ]
+    if any(marker in step for marker in executable_markers):
+        return "execute"
+
+    # Unknown or writing-like step: let the Replanner turn it into a final answer
+    # or a concrete executable plan, rather than burning quota in the Executor.
+    return "replan"
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +1117,7 @@ builder.add_node("tools",             ToolNode(tools))
 builder.add_node("after_tools_node",  after_tools)
 builder.add_node("no_match_injector", no_match_injector_node)
 builder.add_node("replan",            replan_node)
+builder.add_node("critic",            critic_node)
 builder.add_node("formatter",         formatter_node)
 
 builder.add_edge(START,     "planner")
@@ -884,6 +1138,11 @@ builder.add_edge("no_match_injector", "replan")
 
 builder.add_conditional_edges(
     "replan", should_end,
+    {"execute": "execute", "formatter": "critic", "replan": "replan"},
+)
+
+builder.add_conditional_edges(
+    "critic", route_after_critic,
     {"execute": "execute", "formatter": "formatter", "replan": "replan"},
 )
 
@@ -907,6 +1166,7 @@ PROGRESS_MAP = {
     "after_tools_node":  "📊  Processing tool results...",
     "no_match_injector": "💡  Destination not found — searching for alternatives...",
     "replan":            "🔄  Reviewing progress and re-evaluating plan...",
+    "critic":            "🧪  Critic is checking the draft answer and reflection memory...",
     # "formatter":         "✨  Formatting final report...",
 }
 
@@ -918,7 +1178,7 @@ def run_agent():
     thread_id = input("Enter Session ID (e.g., student_01): ").strip() or "default"
     config = {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": MAX_REPLAN_CYCLES * MAX_EXECUTOR_STEPS * 4,
+        #   "recursion_limit": MAX_REPLAN_CYCLES * MAX_EXECUTOR_STEPS * 4,
     }
 
     # Load / initialise state
@@ -936,6 +1196,10 @@ def run_agent():
                 "calculated_total": 0.0,
                 "over_budget": False,
                 "user_preferences": {},
+                "chat_history": "",
+                "reflection_memory": [],
+                "critic_passed": False,
+                "critic_count": 0,
                 "messages": [],
             })
         else:
@@ -965,8 +1229,10 @@ def run_agent():
             try:
                 prev_state = graph.get_state(config)
                 saved_prefs = (prev_state.values or {}).get("user_preferences") or {}
+                saved_chat_history = (prev_state.values or {}).get("chat_history") or ""
             except Exception:
                 saved_prefs = {}
+                saved_chat_history = ""
 
             initial_state: PlanExecuteState = {
                 "input":          user_input,
@@ -979,6 +1245,10 @@ def run_agent():
                 "calculated_total": 0.0,
                 "over_budget":    False,
                 "user_preferences": saved_prefs,
+                "chat_history":   saved_chat_history,
+                "reflection_memory": [],
+                "critic_passed":  False,
+                "critic_count":   0,
                 "messages":       [],
             }
 
