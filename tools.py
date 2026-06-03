@@ -798,7 +798,7 @@ def fetch_city_transport_info(city: str):
 
 
 @tool
-def ask_user(question: str, options: list = None) -> str:
+def ask_user(question: str, options: list[str] = None) -> str:
     """
     Ask the human user a clarifying question and WAIT for their answer before
     continuing. Use this when the request is genuinely ambiguous or missing a

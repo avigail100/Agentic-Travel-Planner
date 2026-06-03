@@ -62,6 +62,18 @@ from tools import (
 )
 from tools import KNOWN_HOSTS, WEB_CATEGORIES, hosts_for_category
 
+from sif import (
+    get_sif,
+    route_after_planner,
+    sif_plan_gate_node,
+    route_after_plan_gate,
+    route_after_tools_sif,
+    sif_alternatives_gate_node,
+    route_after_alternatives_gate,
+    maybe_sif2_budget_interrupt,
+    SIF_INTERRUPT_HANDLERS,
+)
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -690,8 +702,10 @@ def route_after_tools(state: PlanExecuteState) -> str:
     if _no_match_detected(state["messages"]):
         return "no_match"
     return "execute" if state.get("plan") else "replan"
-
-
+    # NOTE: route_after_tools_sif (imported from sif.py) wraps the logic
+    # above and adds the SIF-2 alternatives gate.  The graph wiring below
+    # uses it in place of route_after_tools for the after_tools_node edge.
+ 
 # ---------------------------------------------------------------------------
 # Node: no_match_injector
 # ---------------------------------------------------------------------------
@@ -885,6 +899,14 @@ def replan_node(state: PlanExecuteState):
         budget_warn = ""
         if budget > 0 and total_cost > budget:
             budget_warn = f"\n\n⚠️  BUDGET ALERT: Estimated ${total_cost:.2f} exceeds your ${budget:.2f} limit."
+            # SIF-2: pause and ask user before delivering over-budget result
+            sif_delta = maybe_sif2_budget_interrupt(state, budget, total_cost)
+            if sif_delta is not None:
+                # User chose approve / new_budget / cancel — let the delta
+                # propagate back; replan_node returns early so the graph
+                # re-routes on the updated state.
+                return {**sif_delta, "replan_count": replan_count}
+
         return {
             "response": result.action.response + budget_warn,
             "plan": [],
@@ -918,6 +940,9 @@ def should_end(state: PlanExecuteState) -> str:
     if not state.get("plan"):
         # Plan is empty but no response yet — force replan to generate one
         return "replan"
+    # Check SIF level. If a new plan exists and SIF is 1, go to approval gate.
+    if get_sif(state) == 1:
+        return "sif_plan_gate"
     return "execute"
 
 
@@ -993,9 +1018,21 @@ builder.add_node("after_tools_node",  after_tools)
 builder.add_node("no_match_injector", no_match_injector_node)
 builder.add_node("replan",            replan_node)
 builder.add_node("formatter",         formatter_node)
+builder.add_node("sif_plan_gate",         sif_plan_gate_node)
+builder.add_node("sif_alternatives_gate", sif_alternatives_gate_node)
+
 
 builder.add_edge(START,     "planner")
-builder.add_edge("planner", "execute")
+# builder.add_edge("planner", "execute")
+# SIF-1: conditionally gate the plan before execution
+builder.add_conditional_edges(
+    "planner", route_after_planner,
+    {"sif_plan_gate": "sif_plan_gate", "execute": "execute"},
+)
+builder.add_conditional_edges(
+    "sif_plan_gate", route_after_plan_gate,
+    {"execute": "execute", END: END},
+)
 
 builder.add_conditional_edges(
     "execute", check_executor_tools,
@@ -1008,17 +1045,26 @@ builder.add_conditional_edges(
     {"tools": "tools", "replan": "replan"},
 )
 
-builder.add_edge("tools",             "after_tools_node")
+builder.add_edge("tools", "after_tools_node")
 
 builder.add_conditional_edges(
-    "after_tools_node", route_after_tools,
-    {"execute": "execute", "replan": "replan", "no_match": "no_match_injector"},
+    "after_tools_node", route_after_tools_sif,
+    {"execute": "execute", "replan": "replan",
+      "no_match": "no_match_injector", "sif_alternatives_gate": "sif_alternatives_gate"},
 )
+
 builder.add_edge("no_match_injector", "replan")
+
+# SIF-2 Gate A: after the alternatives prompt, always go to replan
+builder.add_conditional_edges(
+    "sif_alternatives_gate", route_after_alternatives_gate,
+    {"replan": "replan"},
+)
 
 builder.add_conditional_edges(
     "replan", should_end,
-    {"execute": "execute", "formatter": "formatter", "replan": "replan"},
+    {"execute": "execute", "formatter": "formatter", 
+    "replan": "replan", "sif_plan_gate": "sif_plan_gate"},
 )
 
 builder.add_edge("formatter", END)
@@ -1136,6 +1182,9 @@ def _resume_value_for(payload: dict):
         return _prompt_user_question(payload)      # -> str (the user's answer)
     if kind == "web_host_approval":
         return _prompt_host_approval(payload)      # -> dict ({"action": ...})
+    # SIF gates — dispatch to handlers defined in sif.py
+    if kind in SIF_INTERRUPT_HANDLERS:
+        return SIF_INTERRUPT_HANDLERS[kind](payload)
     # Unknown interrupt type — fail safe by cancelling/skipping.
     print(f"  (Unrecognised approval request: {kind!r} — skipping.)")
     return {"action": "cancel"}
@@ -1165,6 +1214,47 @@ def _run_with_hitl(initial_state, config):
         if not interrupted:
             break
 
+SIF_DESCRIPTIONS = {
+    "1": "LOW   — approve every plan before execution",
+    "2": "MEDIUM — offer search narrowing + confirm budget breaches",
+    "3": "HIGH  — autonomous (only web-host approval interrupts)",
+}
+
+def _handle_sif_menu(graph, config: dict) -> None:
+    """Interactive SIF settings menu, triggered by '\' in the main loop.
+
+    Reads the current SIF from user_preferences, shows the menu, and
+    writes the updated value back via graph.update_state so SqliteSaver
+    persists it across sessions.
+    """
+    try:
+        current_state = graph.get_state(config)
+        prefs = dict((current_state.values or {}).get("user_preferences") or {})
+    except Exception:
+        prefs = {}
+
+    current_sif = prefs.get("sif", "3")
+
+    print("\n" + "═" * 62)
+    print("⚙️   AGENT SETTINGS — Self-Independence Factor (SIF)")
+    print("═" * 62)
+    print(f"  Current SIF: {current_sif}  ({SIF_DESCRIPTIONS.get(current_sif, '?')})\n")
+    for key, desc in SIF_DESCRIPTIONS.items():
+        marker = "◀" if key == current_sif else " "
+        print(f"  {key}. {desc}  {marker}")
+    print("-" * 62)
+    print("  Press Enter to keep current setting.")
+    print("═" * 62)
+
+    choice = input("  New SIF level [1/2/3]: ").strip()
+    if choice in ("1", "2", "3") and choice != current_sif:
+        prefs["sif"] = choice
+        graph.update_state(config, {"user_preferences": prefs})
+        print(f"  ✅  SIF updated to {choice} ({SIF_DESCRIPTIONS[choice]}).\n")
+    elif choice == current_sif:
+        print(f"  (SIF unchanged — still {current_sif}.)\n")
+    else:
+        print("  (No change.)\n")
 
 def run_agent():
     print(BANNER)
@@ -1201,10 +1291,14 @@ def run_agent():
                 for k, v in prefs.items():
                     print(f"  - {k.replace('_', ' ').title()}: {v}")
                 print()
+
             else:
                 print(f"[Memory] Welcome back! No stored preferences for '{thread_id}'.\n")
     except Exception as e:
         print(f"Note during session init: {e}")
+    sif_level = (graph.get_state(config).values or {}).get("user_preferences", {}).get("sif", "3")
+    print(f"[SIF] Autonomy level: {sif_level} — {SIF_DESCRIPTIONS.get(sif_level, '')}  (type '\\' to change)\n")
+
 
     print("Let's plan your trip! (type 'quit' to exit)\n")
 
@@ -1216,6 +1310,10 @@ def run_agent():
             if user_input.lower() in ["exit", "quit", "q"]:
                 print("Goodbye — safe travels!")
                 break
+            # '\' opens the SIF settings menu
+            if user_input == "\\":
+                _handle_sif_menu(graph, config)
+                continue
 
             # Carry over user preferences and session host approvals from the
             # previous turn so we don't re-ask for the same host.
