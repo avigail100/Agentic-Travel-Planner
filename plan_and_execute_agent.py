@@ -32,6 +32,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 from typing import TypedDict
 
@@ -57,6 +58,20 @@ from tools import (
     fetch_restaurants,
     fetch_beaches,
     fetch_city_transport_info,
+    ask_user,
+)
+from tools import KNOWN_HOSTS, WEB_CATEGORIES, hosts_for_category
+
+from sif import (
+    get_sif,
+    route_after_planner,
+    sif_plan_gate_node,
+    route_after_plan_gate,
+    route_after_tools_sif,
+    sif_alternatives_gate_node,
+    route_after_alternatives_gate,
+    maybe_sif2_budget_interrupt,
+    SIF_INTERRUPT_HANDLERS,
 )
 
 load_dotenv()
@@ -141,6 +156,7 @@ class PlanExecuteState(TypedDict):
     reflection_memory: List[str]
     critic_passed: bool
     critic_count: int
+    approved_hosts: List[str]   # web hosts the user approved for this session (HITL)
 
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
@@ -151,7 +167,7 @@ tools = [
     lookup_location_options, find_connecting_flights,
     save_preference, suggest_alternatives, search_web,
     find_hotels_by_amenity, find_destinations_by_preference, fetch_restaurants,
-    fetch_beaches, fetch_city_transport_info,
+    fetch_beaches, fetch_city_transport_info, ask_user,
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
@@ -530,9 +546,132 @@ def execute_node(state: PlanExecuteState):
 # ---------------------------------------------------------------------------
 
 def check_executor_tools(state: PlanExecuteState):
-    """Route to tools if the executor requested tool calls, else to replan."""
+    """Route to tools if the executor requested tool calls, else to web_gate."""
     last_msg = state["messages"][-1] if state["messages"] else None
     if last_msg and getattr(last_msg, "tool_calls", None):
+        return "web_gate"
+    return "replan"
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-Loop gate: approve off-allowlist web hosts before searching
+# ---------------------------------------------------------------------------
+
+def _allowed_hosts(state: PlanExecuteState) -> set:
+    """Hosts the agent may search without asking: the baseline KNOWN_HOSTS plus
+    anything the user already approved this session (persisted in state)."""
+    return set(KNOWN_HOSTS) | set(state.get("approved_hosts") or [])
+
+
+def web_gate_node(state: PlanExecuteState) -> dict:
+    """
+    Sits between the executor and the ToolNode. Inspects pending `search_web`
+    calls and, if a search would touch a host that is NOT in the known/approved
+    set, pauses the graph (interrupt) and waits for a human decision:
+
+      - approve : run the search and remember the host(s) for this session
+      - edit    : switch the search to a different (allowed) category
+      - cancel  : skip the search; the executor is told it was declined
+
+    Any non-search tool call (DB lookups, cost math, etc.) passes straight
+    through — those are local and safe, so they never interrupt.
+    """
+    last = state["messages"][-1] if state["messages"] else None
+    tool_calls = list(getattr(last, "tool_calls", None) or [])
+    if not tool_calls:
+        return {}
+
+    allowed = _allowed_hosts(state)
+
+    # Flag EVERY search_web call that would touch an off-allowlist host. The
+    # executor may emit up to two tool calls per step, so we must consider all of
+    # them — a single interrupt covers the whole batch (LangGraph re-runs this
+    # node top-to-bottom on resume, so one interrupt() per execution is correct).
+    flagged = []          # list of (tool_call, unknown_hosts)
+    all_unknown = []      # de-duplicated union of unknown hosts, for the prompt
+    category = None       # the (shared) category to offer alternatives for
+    for tc in tool_calls:
+        if tc.get("name") != "search_web":
+            continue
+        cat = (tc.get("args") or {}).get("category", "")
+        unknown = [h for h in hosts_for_category(cat) if h not in allowed]
+        if unknown:
+            flagged.append((tc, unknown))
+            category = category or cat
+            for h in unknown:
+                if h not in all_unknown:
+                    all_unknown.append(h)
+
+    if not flagged:
+        return {}   # nothing to approve — proceed to tools
+
+    flagged_ids = {tc.get("id") for tc, _ in flagged}
+    # Show the hosts for the first flagged category as the "sources" context.
+    hosts = hosts_for_category(category)
+
+    # PAUSE. Everything the terminal UI needs to render the prompt goes in the
+    # payload; the graph state is checkpointed (SqliteSaver) while we wait.
+    decision = interrupt({
+        "type": "web_host_approval",
+        "query": (flagged[0][0].get("args") or {}).get("query", ""),
+        "category": category,
+        "hosts": hosts,
+        "unknown_hosts": all_unknown,
+        "alternatives": [c for c in WEB_CATEGORIES if c != category],
+    })
+
+    action = (decision or {}).get("action", "cancel")
+
+    if action == "approve":
+        # Remember the approved host(s) for the rest of the session so we don't
+        # ask again, then fall through to the tools node unchanged.
+        already = list(state.get("approved_hosts") or [])
+        return {"approved_hosts": already + [h for h in all_unknown if h not in already]}
+
+    if action == "edit":
+        # User chose a different category. Rewrite every flagged call's category
+        # by re-emitting the AIMessage (add_messages dedupes on id, replacing it).
+        new_category = decision.get("category", category)
+        patched_calls = []
+        for c in tool_calls:
+            if c.get("id") in flagged_ids:
+                c = {**c, "args": {**(c.get("args") or {}), "category": new_category}}
+            patched_calls.append(c)
+        new_ai = AIMessage(content=last.content, tool_calls=patched_calls, id=last.id)
+        return {"messages": [new_ai]}
+
+    # action == "cancel": drop every flagged search_web call and answer each with
+    # a synthetic ToolMessage so the conversation stays valid (every tool_call
+    # needs a reply). The executor sees the denial and proceeds without web data.
+    kept_calls = [c for c in tool_calls if c.get("id") not in flagged_ids]
+    new_ai = AIMessage(content=last.content, tool_calls=kept_calls, id=last.id)
+    denials = [
+        ToolMessage(
+            content=(
+                f"[DECLINED BY USER] The web search to "
+                f"{', '.join(hosts_for_category((tc.get('args') or {}).get('category', '')))} "
+                f"was not approved. Proceed using only database tools and "
+                f"already-gathered information; do not retry this search."
+            ),
+            tool_call_id=tc.get("id"),
+            name="search_web",
+        )
+        for tc, _ in flagged
+    ]
+    return {"messages": [new_ai] + denials}
+
+
+def route_after_gate(state: PlanExecuteState) -> str:
+    """After the gate: go to tools only if approved tool calls remain, else
+    skip straight to replan (e.g. the user cancelled the only pending search)."""
+    last = state["messages"][-1] if state["messages"] else None
+    # If the last message is our denial ToolMessage, look back at the AIMessage.
+    if isinstance(last, ToolMessage):
+        for m in reversed(state["messages"]):
+            if isinstance(m, AIMessage):
+                last = m
+                break
+    if last and getattr(last, "tool_calls", None):
         return "tools"
     return "replan"
 
@@ -596,8 +735,10 @@ def route_after_tools(state: PlanExecuteState) -> str:
     if _no_match_detected(state["messages"]):
         return "no_match"
     return "execute" if state.get("plan") else "replan"
-
-
+    # NOTE: route_after_tools_sif (imported from sif.py) wraps the logic
+    # above and adds the SIF-2 alternatives gate.  The graph wiring below
+    # uses it in place of route_after_tools for the after_tools_node edge.
+ 
 # ---------------------------------------------------------------------------
 # Node: no_match_injector
 # ---------------------------------------------------------------------------
@@ -801,6 +942,14 @@ def replan_node(state: PlanExecuteState):
         budget_warn = ""
         if budget > 0 and total_cost > budget:
             budget_warn = f"\n\n⚠️  BUDGET ALERT: Estimated ${total_cost:.2f} exceeds your ${budget:.2f} limit."
+            # SIF-2: pause and ask user before delivering over-budget result
+            sif_delta = maybe_sif2_budget_interrupt(state, budget, total_cost)
+            if sif_delta is not None:
+                # User chose approve / new_budget / cancel — let the delta
+                # propagate back; replan_node returns early so the graph
+                # re-routes on the updated state.
+                return {**sif_delta, "replan_count": replan_count}
+
 
         final_text = result.action.response + budget_warn
 
@@ -849,6 +998,9 @@ def should_end(state: PlanExecuteState) -> str:
     if not state.get("plan"):
         # Plan is empty but no response yet — force replan to generate one
         return "replan"
+    # Check SIF level. If a new plan exists and SIF is 1, go to approval gate.
+    if get_sif(state) == 1:
+        return "sif_plan_gate"
     return "execute"
 
 # ---------------------------------------------------------------------------
@@ -1113,34 +1265,61 @@ builder = StateGraph(PlanExecuteState)
 
 builder.add_node("planner",           plan_node)
 builder.add_node("execute",           execute_node)
+builder.add_node("web_gate",          web_gate_node)
 builder.add_node("tools",             ToolNode(tools))
 builder.add_node("after_tools_node",  after_tools)
 builder.add_node("no_match_injector", no_match_injector_node)
 builder.add_node("replan",            replan_node)
 builder.add_node("critic",            critic_node)
 builder.add_node("formatter",         formatter_node)
+builder.add_node("sif_plan_gate",         sif_plan_gate_node)
+builder.add_node("sif_alternatives_gate", sif_alternatives_gate_node)
+
 
 builder.add_edge(START,     "planner")
-builder.add_edge("planner", "execute")
+# builder.add_edge("planner", "execute")
+# SIF-1: conditionally gate the plan before execution
+builder.add_conditional_edges(
+    "planner", route_after_planner,
+    {"sif_plan_gate": "sif_plan_gate", "execute": "execute"},
+)
+builder.add_conditional_edges(
+    "sif_plan_gate", route_after_plan_gate,
+    {"execute": "execute", END: END},
+)
 
 builder.add_conditional_edges(
     "execute", check_executor_tools,
+    {"web_gate": "web_gate", "replan": "replan"},
+)
+
+# Human-in-the-loop gate: may interrupt for host approval before any web search.
+builder.add_conditional_edges(
+    "web_gate", route_after_gate,
     {"tools": "tools", "replan": "replan"},
 )
 
-builder.add_edge("tools",             "after_tools_node")
+builder.add_edge("tools", "after_tools_node")
 
 builder.add_conditional_edges(
-    "after_tools_node", route_after_tools,
-    {"execute": "execute", "replan": "replan", "no_match": "no_match_injector"},
+    "after_tools_node", route_after_tools_sif,
+    {"execute": "execute", "replan": "replan",
+      "no_match": "no_match_injector", "sif_alternatives_gate": "sif_alternatives_gate"},
 )
+
 builder.add_edge("no_match_injector", "replan")
+
+# SIF-2 Gate A: after the alternatives prompt, always go to replan
+builder.add_conditional_edges(
+    "sif_alternatives_gate", route_after_alternatives_gate,
+    {"replan": "replan"},
+)
 
 builder.add_conditional_edges(
     "replan", should_end,
-    {"execute": "execute", "formatter": "critic", "replan": "replan"},
+    {"execute": "execute", "formatter": "critic",
+     "replan": "replan", "sif_plan_gate": "sif_plan_gate"},
 )
-
 builder.add_conditional_edges(
     "critic", route_after_critic,
     {"execute": "execute", "formatter": "formatter", "replan": "replan"},
@@ -1170,6 +1349,171 @@ PROGRESS_MAP = {
     # "formatter":         "✨  Formatting final report...",
 }
 
+
+def _prompt_user_question(payload: dict) -> str:
+    """Render an interactive clarifying-question prompt (from the ask_user tool)
+    and return the user's answer string. Supports numbered options plus
+    free-text; an empty answer is allowed and passed back to the agent."""
+    question = (payload.get("question") or "").strip()
+    options  = payload.get("options") or []
+
+    print("\n" + "═" * 62)
+    print("💬  THE AGENT NEEDS YOUR INPUT")
+    print("═" * 62)
+    print(f"  {question}")
+    if options:
+        print("-" * 62)
+        for i, opt in enumerate(options, 1):
+            print(f"    {i}. {opt}")
+        print("-" * 62)
+        print("  Pick a number, or just type your own answer.")
+    print("═" * 62)
+
+    prompt = f"  Your answer [1-{len(options)} or text]: " if options else "  Your answer: "
+    raw = input(prompt).strip()
+
+    # A bare number selects the matching option; anything else is free-text.
+    if options and raw.isdigit() and 1 <= int(raw) <= len(options):
+        chosen = options[int(raw) - 1]
+        print(f"  ✅  You chose: {chosen}\n")
+        return chosen
+
+    if raw:
+        print(f"  ✅  Noted: {raw}\n")
+    else:
+        print("  (No answer given — the agent will proceed with its best guess.)\n")
+    return raw
+
+
+def _prompt_host_approval(payload: dict) -> dict:
+    """Render the interactive approve/edit/cancel prompt for a web-host
+    approval interrupt and return the user's decision dict (the resume value)."""
+    query   = payload.get("query", "")
+    category = payload.get("category", "")
+    unknown = payload.get("unknown_hosts", [])
+    hosts   = payload.get("hosts", [])
+    alts    = payload.get("alternatives", [])
+
+    print("\n" + "═" * 62)
+    print("⏸️   HUMAN APPROVAL NEEDED — web search to an unapproved host")
+    print("═" * 62)
+    print(f"  The agent wants to run a web search:")
+    print(f"    • query    : {query}")
+    print(f"    • category : {category}")
+    print(f"    • sources  : {', '.join(hosts) or '(none)'}")
+    print(f"  ⚠️  Not on the known-hosts allowlist: {', '.join(unknown)}")
+    print("-" * 62)
+    print("  [a] Approve  — search these source(s) (remembered for this session)")
+    print("  [e] Edit     — switch to a different, trusted category")
+    print("  [c] Cancel   — skip this search; let the agent continue without it")
+    print("═" * 62)
+
+    while True:
+        choice = input("  Your choice [a/e/c]: ").strip().lower()
+        if choice in ("a", "approve"):
+            print(f"  ✅  Approved — searching {', '.join(unknown)}.\n")
+            return {"action": "approve"}
+        if choice in ("c", "cancel", ""):
+            print("  🚫  Cancelled — the agent will proceed without this search.\n")
+            return {"action": "cancel"}
+        if choice in ("e", "edit"):
+            if not alts:
+                print("  (No alternative categories available — pick a or c.)")
+                continue
+            print("  Choose a replacement category:")
+            for i, c in enumerate(alts, 1):
+                print(f"    {i}. {c}  ({', '.join(hosts_for_category(c))})")
+            sel = input(f"  Category number [1-{len(alts)}]: ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(alts):
+                new_cat = alts[int(sel) - 1]
+                print(f"  ✏️   Switched to '{new_cat}'.\n")
+                return {"action": "edit", "category": new_cat}
+            print("  Invalid selection — try again.")
+            continue
+        print("  Please enter 'a', 'e', or 'c'.")
+
+
+def _resume_value_for(payload: dict):
+    """Map an interrupt payload to the right interactive prompt and return the
+    value the graph should be resumed with."""
+    kind = (payload or {}).get("type")
+    if kind == "user_question":
+        return _prompt_user_question(payload)      # -> str (the user's answer)
+    if kind == "web_host_approval":
+        return _prompt_host_approval(payload)      # -> dict ({"action": ...})
+    # SIF gates — dispatch to handlers defined in sif.py
+    if kind in SIF_INTERRUPT_HANDLERS:
+        return SIF_INTERRUPT_HANDLERS[kind](payload)
+    # Unknown interrupt type — fail safe by cancelling/skipping.
+    print(f"  (Unrecognised approval request: {kind!r} — skipping.)")
+    return {"action": "cancel"}
+
+
+def _run_with_hitl(initial_state, config):
+    """Stream the graph, transparently handling human-in-the-loop interrupts:
+    when the graph pauses (host approval or a clarifying question), prompt the
+    user and resume with Command(resume=...), looping until the run completes
+    with no interrupt."""
+    stream_input = initial_state
+    while True:
+        interrupted = False
+        for chunk in graph.stream(stream_input, config, stream_mode="updates"):
+            if not chunk:
+                continue
+            # LangGraph surfaces a pause under the "__interrupt__" key.
+            if "__interrupt__" in chunk:
+                intr = chunk["__interrupt__"]
+                payload = intr[0].value if isinstance(intr, (list, tuple)) else intr.value
+                stream_input = Command(resume=_resume_value_for(payload))
+                interrupted = True
+                break
+            for node_name in chunk:
+                if node_name in PROGRESS_MAP:
+                    print(PROGRESS_MAP[node_name])
+        if not interrupted:
+            break
+
+SIF_DESCRIPTIONS = {
+    "1": "LOW   — approve every plan before execution",
+    "2": "MEDIUM — offer search narrowing + confirm budget breaches",
+    "3": "HIGH  — autonomous (only web-host approval interrupts)",
+}
+
+def _handle_sif_menu(graph, config: dict) -> None:
+    """Interactive SIF settings menu, triggered by '\' in the main loop.
+
+    Reads the current SIF from user_preferences, shows the menu, and
+    writes the updated value back via graph.update_state so SqliteSaver
+    persists it across sessions.
+    """
+    try:
+        current_state = graph.get_state(config)
+        prefs = dict((current_state.values or {}).get("user_preferences") or {})
+    except Exception:
+        prefs = {}
+
+    current_sif = prefs.get("sif", "3")
+
+    print("\n" + "═" * 62)
+    print("⚙️   AGENT SETTINGS — Self-Independence Factor (SIF)")
+    print("═" * 62)
+    print(f"  Current SIF: {current_sif}  ({SIF_DESCRIPTIONS.get(current_sif, '?')})\n")
+    for key, desc in SIF_DESCRIPTIONS.items():
+        marker = "◀" if key == current_sif else " "
+        print(f"  {key}. {desc}  {marker}")
+    print("-" * 62)
+    print("  Press Enter to keep current setting.")
+    print("═" * 62)
+
+    choice = input("  New SIF level [1/2/3]: ").strip()
+    if choice in ("1", "2", "3") and choice != current_sif:
+        prefs["sif"] = choice
+        graph.update_state(config, {"user_preferences": prefs})
+        print(f"  ✅  SIF updated to {choice} ({SIF_DESCRIPTIONS[choice]}).\n")
+    elif choice == current_sif:
+        print(f"  (SIF unchanged — still {current_sif}.)\n")
+    else:
+        print("  (No change.)\n")
 
 def run_agent():
     print(BANNER)
@@ -1201,6 +1545,7 @@ def run_agent():
                 "critic_passed": False,
                 "critic_count": 0,
                 "messages": [],
+                "approved_hosts": [],
             })
         else:
             prefs = existing.values.get("user_preferences") or {}
@@ -1209,10 +1554,14 @@ def run_agent():
                 for k, v in prefs.items():
                     print(f"  - {k.replace('_', ' ').title()}: {v}")
                 print()
+
             else:
                 print(f"[Memory] Welcome back! No stored preferences for '{thread_id}'.\n")
     except Exception as e:
         print(f"Note during session init: {e}")
+    sif_level = (graph.get_state(config).values or {}).get("user_preferences", {}).get("sif", "3")
+    print(f"[SIF] Autonomy level: {sif_level} — {SIF_DESCRIPTIONS.get(sif_level, '')}  (type '\\' to change)\n")
+
 
     print("Let's plan your trip! (type 'quit' to exit)\n")
 
@@ -1224,14 +1573,20 @@ def run_agent():
             if user_input.lower() in ["exit", "quit", "q"]:
                 print("Goodbye — safe travels!")
                 break
+            # '\' opens the SIF settings menu
+            if user_input == "\\":
+                _handle_sif_menu(graph, config)
+                continue
 
-            # Carry over user preferences from previous turn
+            # Carry over user preferences and session host approvals from the
+            # previous turn so we don't re-ask for the same host.
             try:
                 prev_state = graph.get_state(config)
                 saved_prefs = (prev_state.values or {}).get("user_preferences") or {}
                 saved_chat_history = (prev_state.values or {}).get("chat_history") or ""
+                saved_hosts = (prev_state.values or {}).get("approved_hosts") or []
             except Exception:
-                saved_prefs = {}
+                saved_prefs, saved_hosts = {}, []
                 saved_chat_history = ""
 
             initial_state: PlanExecuteState = {
@@ -1250,16 +1605,12 @@ def run_agent():
                 "critic_passed":  False,
                 "critic_count":   0,
                 "messages":       [],
+                "approved_hosts": list(saved_hosts),
             }
 
             print("\nSearching...\n")
 
-            for chunk in graph.stream(initial_state, config, stream_mode="updates"):
-                if not chunk:
-                    continue
-                for node_name, _ in chunk.items():
-                    if node_name in PROGRESS_MAP:
-                        print(PROGRESS_MAP[node_name])
+            _run_with_hitl(initial_state, config)
 
         except KeyboardInterrupt:
             print("\nGoodbye — safe travels!")
