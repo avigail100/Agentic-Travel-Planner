@@ -1105,7 +1105,7 @@ def critic_node(state: PlanExecuteState):
             "critic_count": critic_count,
         }
 
-    print("\n[Critic] Decision:", "PASS ✅" if result.passed else "FAIL ❌")
+    print("\n[Critic] Decision:", "PASS ✅" if result.passed else "FAIL")
 
     if result.issues:
         print("[Critic] Issues found:")
@@ -1517,7 +1517,7 @@ def _handle_sif_menu(graph, config: dict) -> None:
 
 def run_agent():
     print(BANNER)
-    print("Plan-and-Execute travel agent — session 5.\n")
+    print("Plan-and-Execute travel agent — session 6.\n")
 
     thread_id = input("Enter Session ID (e.g., student_01): ").strip() or "default"
     config = {
@@ -1560,7 +1560,7 @@ def run_agent():
     except Exception as e:
         print(f"Note during session init: {e}")
     sif_level = (graph.get_state(config).values or {}).get("user_preferences", {}).get("sif", "3")
-    print(f"[SIF] Autonomy level: {sif_level} — {SIF_DESCRIPTIONS.get(sif_level, '')}  (type '\\' to change)\n")
+    print(f"[SIF] Autonomy level: {sif_level} — {SIF_DESCRIPTIONS.get(sif_level, '')}  (type '/' to change)\n")
 
 
     print("Let's plan your trip! (type 'quit' to exit)\n")
@@ -1573,8 +1573,8 @@ def run_agent():
             if user_input.lower() in ["exit", "quit", "q"]:
                 print("Goodbye — safe travels!")
                 break
-            # '\' opens the SIF settings menu
-            if user_input == "\\":
+            # '/' opens the SIF settings menu
+            if user_input == "/":
                 _handle_sif_menu(graph, config)
                 continue
 
