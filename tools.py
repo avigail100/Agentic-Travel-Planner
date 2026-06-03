@@ -556,6 +556,30 @@ _WEB_SOURCES = {
     "events":   ["reuters.com"],
 }
 
+# Human-in-the-loop policy: hosts the agent is pre-authorised to search without
+# asking the user. Any host a web search would touch that is NOT in this set
+# triggers an interrupt so the user can approve/edit/cancel before we hit the
+# network (see the web_gate node in plan_and_execute_agent.py).
+#
+# Note: "accuweather.com" is intentionally left OUT of the baseline so a normal
+# weather search exercises the approval flow — useful for the demo. The user can
+# approve it for the session, after which it won't ask again.
+KNOWN_HOSTS = {
+    "bbc.com", "reuters.com", "apnews.com",
+    "xe.com", "x-rates.com",
+    "weather.com",
+}
+
+
+def hosts_for_category(category: str) -> list:
+    """Hosts that search_web would query for a given category (its allowlist).
+    Returns [] for an unknown category."""
+    return list(_WEB_SOURCES.get((category or "").strip().lower(), []))
+
+
+# The valid search_web categories (used by the HITL gate to offer alternatives).
+WEB_CATEGORIES = list(_WEB_SOURCES.keys())
+
 
 def _host_on_allowlist(result: dict, hosts: list) -> bool:
     """True only if a search result's URL is https AND its hostname is on the
@@ -771,3 +795,49 @@ def fetch_city_transport_info(city: str):
         return f"No public transport information found for {city}."
 
     return matches
+
+
+@tool
+def ask_user(question: str, options: list = None) -> str:
+    """
+    Ask the human user a clarifying question and WAIT for their answer before
+    continuing. Use this when the request is genuinely ambiguous or missing a
+    preference you cannot reasonably infer (e.g. budget not stated, "a warm
+    place" without a vibe, unclear dates) — NOT for things you can decide
+    yourself or already know from memory.
+
+    This pauses the agent (a human-in-the-loop checkpoint) and surfaces the
+    question in the terminal. The user can pick one of your suggested options or
+    type a free-text answer.
+
+    Input:
+    - question: a single, specific question, e.g.
+        "What's your approximate budget for this trip?"
+    - options: OPTIONAL list of 2-5 short suggested answers the user can pick by
+        number, e.g. ["Beaches & relaxation", "City & culture", "Adventure"].
+        Omit it for purely open questions. The user may always answer freely.
+
+    Returns: the user's answer as a string. Treat it as authoritative and
+    incorporate it into the rest of the plan.
+    """
+    # Imported lazily so tools.py stays importable without langgraph at hand.
+    from langgraph.types import interrupt
+
+    q = (question or "").strip()
+    if not q:
+        return "No question was provided to ask the user."
+
+    opts = [str(o).strip() for o in (options or []) if str(o).strip()]
+
+    # PAUSE the graph. The interactive terminal UI (in plan_and_execute_agent.py)
+    # renders this payload, collects the answer, and resumes the graph with it.
+    answer = interrupt({
+        "type": "user_question",
+        "question": q,
+        "options": opts,
+    })
+
+    answer = (str(answer) if answer is not None else "").strip()
+    if not answer:
+        return f"(The user was asked: '{q}' but did not provide an answer.)"
+    return f"The user answered: {answer}"
