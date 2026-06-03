@@ -58,7 +58,6 @@ from tools import (
     fetch_restaurants,
     fetch_beaches,
     fetch_city_transport_info,
-    ask_user,
 )
 from tools import KNOWN_HOSTS, WEB_CATEGORIES, hosts_for_category
 
@@ -132,7 +131,7 @@ tools = [
     lookup_location_options, find_connecting_flights,
     save_preference, suggest_alternatives, search_web,
     find_hotels_by_amenity, find_destinations_by_preference, fetch_restaurants,
-    fetch_beaches, fetch_city_transport_info, ask_user,
+    fetch_beaches, fetch_city_transport_info,
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
@@ -538,40 +537,32 @@ def web_gate_node(state: PlanExecuteState) -> dict:
 
     allowed = _allowed_hosts(state)
 
-    # Flag EVERY search_web call that would touch an off-allowlist host. The
-    # executor may emit up to two tool calls per step, so we must consider all of
-    # them — a single interrupt covers the whole batch (LangGraph re-runs this
-    # node top-to-bottom on resume, so one interrupt() per execution is correct).
-    flagged = []          # list of (tool_call, unknown_hosts)
-    all_unknown = []      # de-duplicated union of unknown hosts, for the prompt
-    category = None       # the (shared) category to offer alternatives for
+    # Find the first search_web call that would touch an off-allowlist host.
+    flagged = None
     for tc in tool_calls:
         if tc.get("name") != "search_web":
             continue
-        cat = (tc.get("args") or {}).get("category", "")
-        unknown = [h for h in hosts_for_category(cat) if h not in allowed]
+        category = (tc.get("args") or {}).get("category", "")
+        hosts = hosts_for_category(category)
+        unknown = [h for h in hosts if h not in allowed]
         if unknown:
-            flagged.append((tc, unknown))
-            category = category or cat
-            for h in unknown:
-                if h not in all_unknown:
-                    all_unknown.append(h)
+            flagged = (tc, category, hosts, unknown)
+            break
 
-    if not flagged:
+    if flagged is None:
         return {}   # nothing to approve — proceed to tools
 
-    flagged_ids = {tc.get("id") for tc, _ in flagged}
-    # Show the hosts for the first flagged category as the "sources" context.
-    hosts = hosts_for_category(category)
+    tc, category, hosts, unknown = flagged
 
     # PAUSE. Everything the terminal UI needs to render the prompt goes in the
     # payload; the graph state is checkpointed (SqliteSaver) while we wait.
     decision = interrupt({
         "type": "web_host_approval",
-        "query": (flagged[0][0].get("args") or {}).get("query", ""),
+        "tool_call_id": tc.get("id"),
+        "query": (tc.get("args") or {}).get("query", ""),
         "category": category,
         "hosts": hosts,
-        "unknown_hosts": all_unknown,
+        "unknown_hosts": unknown,
         "alternatives": [c for c in WEB_CATEGORIES if c != category],
     })
 
@@ -581,39 +572,40 @@ def web_gate_node(state: PlanExecuteState) -> dict:
         # Remember the approved host(s) for the rest of the session so we don't
         # ask again, then fall through to the tools node unchanged.
         already = list(state.get("approved_hosts") or [])
-        return {"approved_hosts": already + [h for h in all_unknown if h not in already]}
+        return {"approved_hosts": already + [h for h in unknown if h not in already]}
 
     if action == "edit":
-        # User chose a different category. Rewrite every flagged call's category
-        # by re-emitting the AIMessage (add_messages dedupes on id, replacing it).
+        # User chose a different category. Rewrite the tool call in place by
+        # re-emitting the AIMessage with the patched args (add_messages dedupes
+        # on id, so this replaces the original).
         new_category = decision.get("category", category)
         patched_calls = []
         for c in tool_calls:
-            if c.get("id") in flagged_ids:
+            if c.get("id") == tc.get("id"):
                 c = {**c, "args": {**(c.get("args") or {}), "category": new_category}}
             patched_calls.append(c)
-        new_ai = AIMessage(content=last.content, tool_calls=patched_calls, id=last.id)
+        new_ai = AIMessage(
+            content=last.content,
+            tool_calls=patched_calls,
+            id=last.id,
+        )
         return {"messages": [new_ai]}
 
-    # action == "cancel": drop every flagged search_web call and answer each with
-    # a synthetic ToolMessage so the conversation stays valid (every tool_call
-    # needs a reply). The executor sees the denial and proceeds without web data.
-    kept_calls = [c for c in tool_calls if c.get("id") not in flagged_ids]
+    # action == "cancel": drop the search_web call and answer it with a synthetic
+    # ToolMessage so the conversation stays valid (every tool_call needs a reply).
+    # The executor sees the denial and can proceed without the web data.
+    kept_calls = [c for c in tool_calls if c.get("id") != tc.get("id")]
     new_ai = AIMessage(content=last.content, tool_calls=kept_calls, id=last.id)
-    denials = [
-        ToolMessage(
-            content=(
-                f"[DECLINED BY USER] The web search to "
-                f"{', '.join(hosts_for_category((tc.get('args') or {}).get('category', '')))} "
-                f"was not approved. Proceed using only database tools and "
-                f"already-gathered information; do not retry this search."
-            ),
-            tool_call_id=tc.get("id"),
-            name="search_web",
-        )
-        for tc, _ in flagged
-    ]
-    return {"messages": [new_ai] + denials}
+    denial = ToolMessage(
+        content=(
+            f"[DECLINED BY USER] The web search to {', '.join(unknown)} was not "
+            f"approved. Proceed using only database tools and already-gathered "
+            f"information; do not retry this search."
+        ),
+        tool_call_id=tc.get("id"),
+        name="search_web",
+    )
+    return {"messages": [new_ai, denial]}
 
 
 def route_after_gate(state: PlanExecuteState) -> str:
@@ -1045,41 +1037,6 @@ PROGRESS_MAP = {
 }
 
 
-def _prompt_user_question(payload: dict) -> str:
-    """Render an interactive clarifying-question prompt (from the ask_user tool)
-    and return the user's answer string. Supports numbered options plus
-    free-text; an empty answer is allowed and passed back to the agent."""
-    question = (payload.get("question") or "").strip()
-    options  = payload.get("options") or []
-
-    print("\n" + "═" * 62)
-    print("💬  THE AGENT NEEDS YOUR INPUT")
-    print("═" * 62)
-    print(f"  {question}")
-    if options:
-        print("-" * 62)
-        for i, opt in enumerate(options, 1):
-            print(f"    {i}. {opt}")
-        print("-" * 62)
-        print("  Pick a number, or just type your own answer.")
-    print("═" * 62)
-
-    prompt = f"  Your answer [1-{len(options)} or text]: " if options else "  Your answer: "
-    raw = input(prompt).strip()
-
-    # A bare number selects the matching option; anything else is free-text.
-    if options and raw.isdigit() and 1 <= int(raw) <= len(options):
-        chosen = options[int(raw) - 1]
-        print(f"  ✅  You chose: {chosen}\n")
-        return chosen
-
-    if raw:
-        print(f"  ✅  Noted: {raw}\n")
-    else:
-        print("  (No answer given — the agent will proceed with its best guess.)\n")
-    return raw
-
-
 def _prompt_host_approval(payload: dict) -> dict:
     """Render the interactive approve/edit/cancel prompt for a web-host
     approval interrupt and return the user's decision dict (the resume value)."""
@@ -1128,24 +1085,10 @@ def _prompt_host_approval(payload: dict) -> dict:
         print("  Please enter 'a', 'e', or 'c'.")
 
 
-def _resume_value_for(payload: dict):
-    """Map an interrupt payload to the right interactive prompt and return the
-    value the graph should be resumed with."""
-    kind = (payload or {}).get("type")
-    if kind == "user_question":
-        return _prompt_user_question(payload)      # -> str (the user's answer)
-    if kind == "web_host_approval":
-        return _prompt_host_approval(payload)      # -> dict ({"action": ...})
-    # Unknown interrupt type — fail safe by cancelling/skipping.
-    print(f"  (Unrecognised approval request: {kind!r} — skipping.)")
-    return {"action": "cancel"}
-
-
 def _run_with_hitl(initial_state, config):
     """Stream the graph, transparently handling human-in-the-loop interrupts:
-    when the graph pauses (host approval or a clarifying question), prompt the
-    user and resume with Command(resume=...), looping until the run completes
-    with no interrupt."""
+    when the graph pauses for host approval, prompt the user and resume with a
+    Command(resume=...), looping until the run completes with no interrupt."""
     stream_input = initial_state
     while True:
         interrupted = False
@@ -1156,7 +1099,8 @@ def _run_with_hitl(initial_state, config):
             if "__interrupt__" in chunk:
                 intr = chunk["__interrupt__"]
                 payload = intr[0].value if isinstance(intr, (list, tuple)) else intr.value
-                stream_input = Command(resume=_resume_value_for(payload))
+                decision = _prompt_host_approval(payload)
+                stream_input = Command(resume=decision)
                 interrupted = True
                 break
             for node_name in chunk:
