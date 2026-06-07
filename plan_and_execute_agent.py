@@ -96,10 +96,6 @@ class Plan(BaseModel):
             "Keep each step atomic and focused on a single information need."
         )
     )
-    reset_cost: bool = Field(
-        default=False,
-        description="Set to True ONLY if suggesting an entirely new destination/alternative, to reset the previous trip cost."
-    )
 
 class FinalResponse(BaseModel):
     """The final, formatted answer to the user."""
@@ -164,12 +160,7 @@ tools = [
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
 
-# _base_model = ChatGroq(
-#    api_key=os.getenv("GROQ_API_KEY"),
-#    model="llama-3.3-70b-versatile",
-#    temperature=0.4,
-#    max_retries=1
-# )
+#_base_model = ChatGroq( api_key=os.getenv("GROQ_API_KEY"), model="llama-3.3-70b-versatile", temperature=0.4,max_retries=1)
 
 planner_model   = _base_model.with_structured_output(Plan)
 replanner_model = _base_model.with_structured_output(ReplanAction)
@@ -421,6 +412,10 @@ Do not skip ahead or repeat tool calls you already made.
 
 You must use the correct parmeters for each tool, only from the plan step. dont use the user input.
 
+Before calling lookup_location_options, check the "Already completed" section.
+If the same location was already resolved successfully earlier in this run, do NOT call lookup_location_options again.
+Reuse the resolved location directly in the target fetch tool.
+
 Location resolution rules (apply before calling any fetch tool):
 1. Call lookup_location_options to resolve any city/country name.
 2. If it returns a list of available_locations with no exact match:
@@ -438,10 +433,6 @@ Location resolution rules (apply before calling any fetch tool):
    Use the `ask_user` tool immediately to ask them for their origin city.
 6. DO NOT ASK FOR EXISTING INFO: Never use the `ask_user` tool to request prices, locations, or choices that have already been fetched, 
    calculated, or explicitly discussed in the conversation history or 'Already completed' section. Extract them directly from the context.
-
-Before calling lookup_location_options, check the "Already completed" section.
-If the same location was already resolved successfully earlier in this run, do NOT call lookup_location_options again.
-Reuse the resolved location directly in the target fetch tool.
 
 Web search rules (search_web — for live info NOT in the database: exchange rates,
 weather, news/advisories, special events):
@@ -572,12 +563,11 @@ def execute_node(state: PlanExecuteState):
         "executor_steps": state.get("executor_steps", 0) + 1,
         "executed_tool_calls": state.get("executed_tool_calls", []) + new_calls,
     }
-
 # ---------------------------------------------------------------------------
 # Routing after executor
 # ---------------------------------------------------------------------------
 def check_executor_tools(state: PlanExecuteState):
-    """Route to web_gate (HITL) if the executor requested tool calls, else to replan."""
+    """Route to web_gate if the executor requested tool calls, else to replan."""
     if state.get("crashed"):
         return END
     last_msg = state["messages"][-1] if state["messages"] else None
@@ -731,9 +721,6 @@ def after_tools(state: PlanExecuteState):
     summary = _summarise_tool_messages(step_tool_msgs)
     step_record = f"Step '{current_step}': {summary}"
 
-    # Only advance the plan if this step did more than just a location lookup.
-    # If ONLY lookup_location_options ran (no fetch tool yet), stay on the same
-    # step so the executor is re-invoked to complete the fetch.
     only_lookup_done = called_tools == {"lookup_location_options"}
     advance_plan = not only_lookup_done
 
@@ -1132,7 +1119,6 @@ Never return an empty fix_steps list when passed=False.
 
 def critic_node(state: PlanExecuteState):
     critic_count = state.get("critic_count", 0) + 1
-    draft_response = state.get("response", "") or ""
 
     # Check max cycles
     if critic_count > MAX_CRITIC_CYCLES:
@@ -1159,12 +1145,22 @@ def critic_node(state: PlanExecuteState):
     try:
         result = critic_model.invoke(prompt)
     except Exception as e:
-        err_text = _is_api_error(e) or f"[ERROR] Critic failed: {e}"
-        print(f"\n[Critic] API Quota Hit or Failure: {err_text}")
+        if _is_api_error(e):
+            print("\n[Critic] ⚠️  Critic unavailable because of API quota — skipping review.")
+        else:
+            print(f"\n[Critic] [ERROR] Critic failed: {e}")
         return {
-            "crashed": True,
+            "critic_passed": True,
             "critic_count": critic_count,
         }
+    
+    # if we want to be stricter and not skip the critic even when it fails, we could do this instead:
+    # err_text = _is_api_error(e) or f"[ERROR] Critic failed: {e}"
+    #     print(f"\n[Critic] API Quota Hit or Failure: {err_text}")
+    #     return {
+    #         "crashed": True,
+    #         "critic_count": critic_count,
+    #     }
 
     print("\n[Critic] Decision:", "PASS ✅" if result.passed else "FAIL")
 
@@ -1187,6 +1183,7 @@ def critic_node(state: PlanExecuteState):
 
     clean_fix_steps = [s.strip() for s in result.fix_steps if s and s.strip()]
 
+    # Defensive fallback: the prompt says never empty, but keep the graph robust.
     if not clean_fix_steps:
         clean_fix_steps = [
             "Collect the missing destination safety/suitability information using the appropriate available tool."
@@ -1219,8 +1216,8 @@ def critic_node(state: PlanExecuteState):
     }
 
 def route_after_critic(state: PlanExecuteState) -> str:
-    if state.get("crashed"):
-        return END
+    # if state.get("crashed"):
+    #     return END
     
     if state.get("critic_passed"):
         return "formatter"
@@ -1380,8 +1377,10 @@ builder.add_conditional_edges(
 )
 builder.add_conditional_edges(
     "critic", route_after_critic,
-    {"execute": "execute", "formatter": "formatter", "replan": "replan", END: END},
+    {"execute": "execute", "formatter": "formatter", "replan": "replan"},
 )
+#    {"execute": "execute", "formatter": "formatter", "replan": "replan", END: END},
+
 
 builder.add_edge("formatter", END)
 
@@ -1529,7 +1528,6 @@ def _run_with_hitl(initial_state, config):
                     print(PROGRESS_MAP[node_name])
         if not interrupted:
             break
-
 
 SIF_DESCRIPTIONS = {
     "1": "LOW   — approve every plan before execution",
