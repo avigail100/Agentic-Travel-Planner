@@ -23,12 +23,13 @@ def _run_query(query: str, params: tuple = ()):
         conn.close()
 
 @tool
-def lookup_location_options(search_term: str, service_type: str):
+def lookup_location_options(search_terms: list[str], service_type: str):
     """
-    Use this tool FIRST to resolve ANY location mention based on the service_type.
+    Use this tool FIRST to resolve ALL location mentions based on the service_type in a SINGLE call.
+    You can pass one or multiple locations at once (e.g., origin and destination) to save time.
 
-    When this tool returns a list of available locations and NO exact match was found,
-    you should decide — before doing anything else — whether the situation is:
+    When this tool returns its dictionary of results, check each term. 
+    If a term has "no_direct_match": True, decide — before doing anything else:
 
     CASE A — Semantic equivalence (country→hub, city→airport, region→main city):
         Examples: "Israel" → "TLV", "Rehovot" → "TLV", "Britain" → "London",
@@ -43,35 +44,39 @@ def lookup_location_options(search_term: str, service_type: str):
                 Format exactly: NO_MATCH:<original search term>
 
     Input:
-    - search_term: e.g. 'Israel', 'France', 'Lod', 'Paris'.
+    - search_terms: A list of strings, e.g. ['Israel', 'France'] or ['Lod'].
     - service_type: 'flight', 'hotel', 'activity', 'best_season', 'car_rental',
                     'visa_requirements', 'time_difference'
     Returns:
-    The tool will return one of three possible output structures depending on the execution result:
+    A dictionary mapping each requested search term to its specific result, UNLESS an invalid service_type is provided (which returns a error string). 
+    For each search term in the returned dictionary, the value will be one of two structures:
 
-    1. Direct Match (List of Dicts / List of Strings):
-       If the requested location matches an entry in the database, it returns the raw results directly from the SQL query.
-       Example: [{"available_location": "TLV"}]
+    1. Direct Match (List of Dicts):
+       If the requested location matches an entry in the database, the value is the raw results directly from the SQL query.
+       Example: "paris": [{"available_location": "Paris"}]
 
     2. No Direct Match (Dictionary):
-       If the location is NOT found directly, it returns a JSON-like dictionary containing all valid locations for that service type.
+       If the location is NOT found directly, the value is a JSON-like dictionary containing all valid locations for that service type.
        This dictionary acts as a signal for you to execute CASE A or CASE B logic.
-       Format:
-       {
+       Example:
+       "lod": {
            "no_direct_match": True,
-           "search_term": "<the_original_term_searched>",
-           "service_type": "<the_service_type_searched>",
-           "available_locations": ["<loc1>", "<loc2>", ...],
+           "search_term": "lod",
+           "service_type": "flight",
+           "available_locations": ["Tel Aviv", "London", ...],
            "instruction": "<Specific instructions on how to handle CASE A vs CASE B>"
        }
 
     3. Error Message (String):
-       If an unsupported service_type is requested, it returns a clear string indicating the error.
+       If an unsupported service_type is requested, the tool bypasses the dictionary and returns a clear string indicating the error.
        Format: "ERROR: '<service_type>' is invalid, must be one of: [...]"
     """
-    raw = search_term.strip().lower()
+    # check if no duplicates and lowercase and strip the tearms
+    cleaned_terms = [term.strip().lower() for term in search_terms]
+    if len(cleaned_terms) > 1 and len(set(cleaned_terms)) != len(cleaned_terms):
+        return "ERROR: Duplicate locations detected in search_terms. Origin and destination cannot be the same city."
+    
     svc = service_type.strip().lower()
-    like_param = f"%{raw}%"
 
     SERVICE_MAP = {
         "flight":            {"table": "flights",           "cols": ["origin", "destination"]},
@@ -82,43 +87,50 @@ def lookup_location_options(search_term: str, service_type: str):
         "visa_requirements": {"table": "visa_requirements", "cols": ["origin", "destination"]},
         "time_difference":   {"table": "time_differences",  "cols": ["origin", "destination"]},
     }
+    
+    all_locs_cache = None
+    results = {}
+    for term, raw in zip(search_terms, cleaned_terms):
+        like_param = f"%{raw}%"
 
-    if svc not in SERVICE_MAP:
-        return f"ERROR: '{svc}' is invalid, must be one of: {list(SERVICE_MAP.keys())}"
+        if svc not in SERVICE_MAP:
+            return f"ERROR: '{svc}' is invalid, must be one of: {list(SERVICE_MAP.keys())}"
 
-    table = SERVICE_MAP[svc]["table"]
-    cols  = SERVICE_MAP[svc]["cols"]
+        table = SERVICE_MAP[svc]["table"]
+        cols  = SERVICE_MAP[svc]["cols"]
 
-    # Direct LIKE search first
-    query_parts = [
-        f"SELECT DISTINCT {col} AS available_location FROM {table} WHERE LOWER({col}) LIKE ?"
-        for col in cols
-    ]
-    query = " UNION ".join(query_parts)
-    matches = _run_query(query, tuple([like_param] * len(cols)))
+        # Direct LIKE search first
+        query_parts = [
+            f"SELECT DISTINCT {col} AS available_location FROM {table} WHERE LOWER({col}) LIKE ?"
+            for col in cols
+        ]
+        query = " UNION ".join(query_parts)
+        matches = _run_query(query, tuple([like_param] * len(cols)))
 
-    if matches and not isinstance(matches, str):
-        return matches
+        if matches and not isinstance(matches, str):
+            results[term] = matches
+        else:
+            # No direct match — lazy load full list for CASE A/B logic
+            if all_locs_cache is None:
+                all_loc_parts = [f"SELECT DISTINCT {col} AS loc FROM {table}" for col in cols]
+                all_locs = _run_query(" UNION ".join(all_loc_parts))
+                all_locs_cache = (
+                    [loc["loc"] for loc in all_locs if "loc" in loc]
+                    if isinstance(all_locs, list) else []
+                )
 
-    # No direct match — return full list so the LLM can apply CASE A or CASE B logic
-    all_loc_parts = [f"SELECT DISTINCT {col} AS loc FROM {table}" for col in cols]
-    all_locs = _run_query(" UNION ".join(all_loc_parts))
-    available_locations = (
-        [loc["loc"] for loc in all_locs if "loc" in loc]
-        if isinstance(all_locs, list) else []
-    )
-
-    return {
-        "no_direct_match": True,
-        "search_term": search_term.strip(),
-        "service_type": svc,
-        "available_locations": available_locations,
-        "instruction": (
-            "Decide: is this semantic equivalence (CASE A) or a genuine mismatch (CASE B)? "
-            "CASE A → silently pick the correct item from available_locations and call the target tool immediately. "
-            "CASE B → do not retry, return the exact string:'NO_MATCH:{search_term}'."
-        ),
-    }
+            results[term] = {
+                "no_direct_match": True,
+                "search_term": term,
+                "service_type": svc,
+                "available_locations": all_locs_cache,
+                "instruction": (
+                    "Decide: is this semantic equivalence (CASE A) or a genuine mismatch (CASE B)? "
+                    "CASE A → silently pick the correct item from available_locations and call the target tool immediately. "
+                    "CASE B → do not retry, return the exact string:'NO_MATCH:{search_term}'."
+                )
+            }
+    return results
 
 @tool
 def fetch_flights(origin: str, destination: str = None):
@@ -556,6 +568,30 @@ _WEB_SOURCES = {
     "events":   ["reuters.com"],
 }
 
+# Human-in-the-loop policy: hosts the agent is pre-authorised to search without
+# asking the user. Any host a web search would touch that is NOT in this set
+# triggers an interrupt so the user can approve/edit/cancel before we hit the
+# network (see the web_gate node in plan_and_execute_agent.py).
+#
+# Note: "accuweather.com" is intentionally left OUT of the baseline so a normal
+# weather search exercises the approval flow — useful for the demo. The user can
+# approve it for the session, after which it won't ask again.
+KNOWN_HOSTS = {
+    "bbc.com", "reuters.com", "apnews.com",
+    "xe.com", "x-rates.com",
+    "weather.com",
+}
+
+
+def hosts_for_category(category: str) -> list:
+    """Hosts that search_web would query for a given category (its allowlist).
+    Returns [] for an unknown category."""
+    return list(_WEB_SOURCES.get((category or "").strip().lower(), []))
+
+
+# The valid search_web categories (used by the HITL gate to offer alternatives).
+WEB_CATEGORIES = list(_WEB_SOURCES.keys())
+
 
 def _host_on_allowlist(result: dict, hosts: list) -> bool:
     """True only if a search result's URL is https AND its hostname is on the
@@ -569,7 +605,6 @@ def _host_on_allowlist(result: dict, hosts: list) -> bool:
         return False
     netloc = parsed.netloc.lower().split(":")[0]  # drop any :port
     return any(netloc == h or netloc.endswith("." + h) for h in hosts)
-
 
 @tool
 def search_web(query: str, category: str) -> str:
@@ -689,7 +724,6 @@ def search_web(query: str, category: str) -> str:
         lines.append(f"{i}. {title}{date_str}\n   {content}\n   Source: {url}")
     return "\n".join(lines)
 
-
 @tool
 def save_preference(key: str, value: str) -> str:
     """Save a user travel preference for future sessions.
@@ -771,3 +805,48 @@ def fetch_city_transport_info(city: str):
         return f"No public transport information found for {city}."
 
     return matches
+
+@tool
+def ask_user(question: str, options: list[str] = None) -> str:
+    """
+    Ask the human user a clarifying question and WAIT for their answer before
+    continuing. Use this when the request is genuinely ambiguous or missing a
+    preference you cannot reasonably infer (e.g. budget not stated, "a warm
+    place" without a vibe, unclear dates) — NOT for things you can decide
+    yourself or already know from memory.
+
+    This pauses the agent (a human-in-the-loop checkpoint) and surfaces the
+    question in the terminal. The user can pick one of your suggested options or
+    type a free-text answer.
+
+    Input:
+    - question: a single, specific question, e.g.
+        "What's your approximate budget for this trip?"
+    - options: OPTIONAL list of 2-5 short suggested answers the user can pick by
+        number, e.g. ["Beaches & relaxation", "City & culture", "Adventure"].
+        Omit it for purely open questions. The user may always answer freely.
+
+    Returns: the user's answer as a string. Treat it as authoritative and
+    incorporate it into the rest of the plan.
+    """
+    # Imported lazily so tools.py stays importable without langgraph at hand.
+    from langgraph.types import interrupt
+
+    q = (question or "").strip()
+    if not q:
+        return "No question was provided to ask the user."
+
+    opts = [str(o).strip() for o in (options or []) if str(o).strip()]
+
+    # PAUSE the graph. The interactive terminal UI (in plan_and_execute_agent.py)
+    # renders this payload, collects the answer, and resumes the graph with it.
+    answer = interrupt({
+        "type": "user_question",
+        "question": q,
+        "options": opts,
+    })
+
+    answer = (str(answer) if answer is not None else "").strip()
+    if not answer:
+        return f"(The user was asked: '{q}' but did not provide an answer.)"
+    return f"The user answered: {answer}"

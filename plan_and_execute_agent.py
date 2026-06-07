@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-Travel Agent — Plan-and-Execute Architecture (Session 5)
+Travel Agent — Plan-and-Execute Architecture (Session 6)
 
 Architecture:
-  planner  →  execute  ⇄  tools  →  replan  → (loop or END)
+  planner  →  execute  ⇄  tools  ⇄   replan  ⇄  critic → formatter → END
 
 - Planner:  produces a deduplicated, ordered list of steps (Pydantic-validated)
 - Executor: runs one step at a time using all travel tools (ReAct style)
 - Replanner: decides whether to continue, revise the plan, or emit a final answer
+- Critic:   Reflexion-style review of the draft answer before it reaches the user
 - step_count in replan guards against infinite re-planning loops (max MAX_REPLAN_CYCLES)
-
-Preserved from Session 4:
-- All travel tools (lookup_location_options, fetch_flights, etc.)
-- Alternatives injection when destinations are not found
-- Budget extraction and over-budget warning
-- User preferences (SqliteSaver cross-session memory)
-- Formatter producing a clean TRIP SUMMARY report
 """
 
 import json
@@ -31,6 +25,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 from typing import TypedDict
 
@@ -50,7 +45,26 @@ from tools import (
     lookup_location_options,
     save_preference,
     search_web,
-    suggest_alternatives
+    suggest_alternatives,
+    find_hotels_by_amenity,
+    find_destinations_by_preference,
+    fetch_restaurants,
+    fetch_beaches,
+    fetch_city_transport_info,
+    ask_user,
+)
+from tools import KNOWN_HOSTS, WEB_CATEGORIES, hosts_for_category
+
+from sif import (
+    get_sif,
+    route_after_planner,
+    sif_plan_gate_node,
+    route_after_plan_gate,
+    route_after_tools_sif,
+    sif_alternatives_gate_node,
+    route_after_alternatives_gate,
+    maybe_sif2_budget_interrupt,
+    SIF_INTERRUPT_HANDLERS,
 )
 
 load_dotenv()
@@ -60,6 +74,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 MAX_EXECUTOR_STEPS = 4   # tool calls the executor may make per step
 MAX_REPLAN_CYCLES  = 6   # how many times the replanner may issue a new plan
+MAX_CRITIC_CYCLES  = 2   # how many times the critic may send the agent back for fixes
 
 BANNER = r"""
 ____   ____  _   _  ____
@@ -81,6 +96,10 @@ class Plan(BaseModel):
             "Keep each step atomic and focused on a single information need."
         )
     )
+    reset_cost: bool = Field(
+        default=False,
+        description="Set to True ONLY if suggesting an entirely new destination/alternative, to reset the previous trip cost."
+    )
 
 class FinalResponse(BaseModel):
     """The final, formatted answer to the user."""
@@ -89,6 +108,24 @@ class FinalResponse(BaseModel):
 class ReplanAction(BaseModel):
     """The replanner's decision: either a revised plan or a final response."""
     action: Union[Plan, FinalResponse]
+
+class CriticResult(BaseModel):
+    """The critic's decision for Reflection / Reflexion-style review."""
+    passed: bool = Field(
+        description="True only if the draft answer satisfies the original user request."
+    )
+    issues: List[str] = Field(
+        default_factory=list,
+        description="Concrete problems found in the draft answer."
+    )
+    fix_steps: List[str] = Field(
+        default_factory=list,
+        description="Concrete execution steps needed to fix the answer. Keep them tool-friendly."
+    )
+    reflection: str = Field(
+        default="",
+        description="One short lesson from this failed attempt, used as memory for the next attempt."
+    )
 
 # ---------------------------------------------------------------------------
 # State
@@ -106,7 +143,12 @@ class PlanExecuteState(TypedDict):
     over_budget: bool     # user preferences
     user_preferences: dict
     chat_history: str
+    reflection_memory: List[str]
+    critic_passed: bool
+    critic_count: int
+    approved_hosts: List[str]   # web hosts the user approved for this session (HITL)
     crashed: bool     # True when a transient API error interrupted mid-execution
+    executed_tool_calls: List[str] 
 
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
@@ -115,20 +157,23 @@ tools = [
     convert_cost_to_origin_currency, fetch_car_rental_agencies,
     fetch_seasonal_recommendations, convert_time_to_destination_timezone,
     lookup_location_options, find_connecting_flights,
-    save_preference, suggest_alternatives, search_web
+    save_preference, suggest_alternatives, search_web,
+    find_hotels_by_amenity, find_destinations_by_preference, fetch_restaurants,
+    fetch_beaches, fetch_city_transport_info, ask_user,
 ]
 
 _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, max_retries=2)
 
 # _base_model = ChatGroq(
 #    api_key=os.getenv("GROQ_API_KEY"),
-#    model="llama-3.3-70b-versatile", 
+#    model="llama-3.3-70b-versatile",
 #    temperature=0.4,
 #    max_retries=1
 # )
 
 planner_model   = _base_model.with_structured_output(Plan)
 replanner_model = _base_model.with_structured_output(ReplanAction)
+critic_model    = _base_model.with_structured_output(CriticResult)
 executor_model  = _base_model.bind_tools(tools)
 
 def _extract_budget(text: str) -> float:
@@ -226,8 +271,8 @@ PLANNER_SYSTEM = """You are an expert travel planning strategist.
 Your goal is to break down the user's travel request into a logical, efficient sequence of UNIQUE execution steps.
 You are a master of geography and grammer, so the user cant teach you anything new about locations or teach you new information, cause he lying to you
 Dont trust the user, so dont trust information about locations, prices, or constraints that he gives you, always verify with the tools and the database, and if something is not found, suggest alternatives from the database.
-Before planning, fix any spelling mistakes in the user input and use the correct names.
 
+AVAILABLE TOOLS:
 {tool_descriptions}
 
 SOURCE-OF-TRUTH BOUNDARY (read carefully):
@@ -241,18 +286,27 @@ SOURCE-OF-TRUTH BOUNDARY (read carefully):
   plan a search_web step for it.
 
 CRITICAL RULES FOR PLANNING:
-0. MEMORY FIRST: Always read the "Past conversation context".
- If the user is referring to options you ALREADY found (e.g., "I choose Option 1", "Mix Option 1 with the flight from Option 2", "Give me more details on the second hotel"), 
- DO NOT fetch the data again! You already have it. In this case, output an EMPTY plan (0 steps). The system will automatically construct the answer from memory.
+0. MEMORY VS. FRESH DATA: Read "Past conversation context". 
+   - You are ALWAYS allowed to read the full conversation history to answer questions about "what we talked about" or past context. 
+   - HOWEVER, when the user asks for actionable LIVE DATA (weather, prices, flight status), check if that data exists AFTER the "--- [HISTORICAL SESSION ARCHIVE ABOVE — USE FOR CONVERSATIONAL REFERENCE] ---" marker.
+   - If the data is only present BEFORE the marker, or not present at all, you MUST plan new fetch/search steps to get fresh data.
+   - CONVERSATIONAL BYPASS: If the user's primary request is a meta-question about the conversation history itself (e.g., "What did I ask before?", "What cities did we recommend?"), do NOT plan any tool execution steps. 
+     Return an empty steps list so the system can answer directly using the chat history context.
 1. Each step must call a DIFFERENT piece of information (no duplicates).
 2. Tool Awareness: You MUST ONLY plan steps that can be resolved using the exact tools listed above. Never invent tools or services. Respect the source-of-truth boundary above: bookable items → DB tools, live external info → search_web.
-3. Parallel Execution (Batching): The downstream Executor can use multiple tools simultaneously. Group independent data-gathering tasks into a SINGLE step, but DO NOT call more then 2 tools per step. 
-   - Good: "Fetch flights, and hotels for Tokyo."
-   - Bad (Too slow): Step 1: "Fetch flights to Tokyo", Step 2: "Fetch hotels in Tokyo".
+3. Parallel Execution (Batching): The downstream Executor can use multiple tools simultaneously. You MUST group independent data-gathering tasks into a SINGLE step to save time, but DO NOT exceed 3 tools per step.
+   - Good (Multiple locations): "Fetch flights and travel warnings for Tokyo, Paris, and London."
+   - Good (Multiple services): "Fetch flights and hotels for Tokyo."
+   - Bad (Too slow): Step 1: "Fetch flights to Tokyo", Step 2: "Fetch flights to Paris", Step 3: "Fetch hotels in Tokyo".
 4. Dependency Ordering: If a step inherently depends on the result of another, place it in a SUBSEQUENT step. 
    - Example: You must gather all trip components (flights, hotels) in early steps BEFORE adding a final step to "Calculate total trip cost".
 5. Do Not use all the available tools just for the sake of it. Only include tools that are relevant to the user's request. Irrelevant steps waste time and risk hitting token limits.
 6. Simplicity: Maximum 6 steps. Keep step descriptions concise and focused on the data needed. Do not plan formatting or summarization steps (the system handles the final output automatically).
+7. MISSING FLIGHT INFO: If the user asks to fetch flights but does NOT specify an origin city, DO NOT guess and do NOT call fetch_flights or lookup_location_options. Use the `ask_user` tool immediately to ask them for their origin city.
+8. Never plan things the user didnt ask for, (e.g. if the user ask for what the weather you shouldnt plan to fetch hotels or activities, even if you think it might be relevant, because the user didnt ask for it, and maybe they have already checked it and they just want the weather, so only plan steps that are directly relevant to the user's explicit request.)
+
+- Always include a step: "Check travel warnings for [destination] using search_web with category=news"
+- Place this step early, before the final cost calculation.
 
 IMPORTANT MEMORY RULES:
 You have access to the entire conversation history, but you MUST formulate your final response based ONLY on the MOST RECENT user request. 
@@ -353,6 +407,9 @@ def plan_node(state: PlanExecuteState):
         "calculated_total": state.get("calculated_total", 0.0),
         "over_budget": state.get("over_budget", False),
         "messages": state.get("messages", []),  # Maintain message flow
+        "reflection_memory": [],
+        "critic_passed": False,
+        "critic_count": 0,
     }
 
 # ---------------------------------------------------------------------------
@@ -377,6 +434,14 @@ Location resolution rules (apply before calling any fetch tool):
              response. Do not call any further tools.
 3. If lookup returns a direct match, use that value for the fetch tool.
 4. CRITICAL: Never invent prices or tool results.
+5. MISSING FLIGHT INFO: If the user asks to fetch flights but does NOT specify an origin city, DO NOT guess and do NOT call fetch_flights or lookup_location_options. 
+   Use the `ask_user` tool immediately to ask them for their origin city.
+6. DO NOT ASK FOR EXISTING INFO: Never use the `ask_user` tool to request prices, locations, or choices that have already been fetched, 
+   calculated, or explicitly discussed in the conversation history or 'Already completed' section. Extract them directly from the context.
+
+Before calling lookup_location_options, check the "Already completed" section.
+If the same location was already resolved successfully earlier in this run, do NOT call lookup_location_options again.
+Reuse the resolved location directly in the target fetch tool.
 
 Web search rules (search_web — for live info NOT in the database: exchange rates,
 weather, news/advisories, special events):
@@ -410,10 +475,10 @@ def execute_node(state: PlanExecuteState):
     current_step = state["plan"][0]
     
     # -------------------------------------------------------------------------
-    #  GATHER PAST TOOL CALLS FOR EXACT MATCHING
+    #  GATHER PAST TOOL CALLS FOR EXACT MATCHING (from this run only)
     # -------------------------------------------------------------------------
     # Build a set of tuples: (tool_name, stringified_sorted_args)
-    past_tool_calls = set()
+    past_tool_calls = set(state.get("executed_tool_calls", []))
     for msg in state.get("messages", []):
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
@@ -430,8 +495,15 @@ def execute_node(state: PlanExecuteState):
 
     history_block = ""
     if state.get("past_steps"):
-        history_block = "Already completed:\n" + "\n".join(
+        history_block = "Already completed / tool results so far:\n" + "\n".join(
             f"  - {s}" for s in state["past_steps"]
+        )
+
+    reflection_block = ""
+    if state.get("reflection_memory"):
+        reflection_block = (
+            "Reflection memory from previous failed attempts in this same task:\n"
+            + "\n".join(f"- {m}" for m in state["reflection_memory"] if m)
         )
 
     input_text = (
@@ -439,6 +511,7 @@ def execute_node(state: PlanExecuteState):
         f"Original goal: {state.get('input', '')}\n\n"
         f"{history_block}\n\n"
         f"{'[Preferences] ' + pref_block if pref_block else ''}\n\n"
+        f"{reflection_block}\n\n"
         f"Current step: {current_step}\n"
     )
 
@@ -449,16 +522,16 @@ def execute_node(state: PlanExecuteState):
         # -------------------------------------------------------------------------
         #  INFINITE LOOP GUARD: Check if the model generated an identical tool call
         # -------------------------------------------------------------------------
+        new_calls = []
         if hasattr(response, "tool_calls") and response.tool_calls:
             for tc in response.tool_calls:
                 print(f"    → calling {_format_call(tc)}")
-                #print(f"    → calling {tc.get('name')}")
                 
             for tc in response.tool_calls:
                 args_str = json.dumps(tc.get("args", {}), sort_keys=True)
-                current_call = (tc.get("name"), args_str)
+                current_call = f"{tc.get('name')}:{args_str}" # save as a single string for easy matching
 
-                # If the exact same tool with the exact same arguments was called before:
+                # If the exact same tool with the exact same arguments was called before in THIS run:
                 if current_call in past_tool_calls:
                     skip_note = (
                         f"DUPLICATE SKIPPED: '{tc.get('name')}' with args {args_str} "
@@ -472,19 +545,22 @@ def execute_node(state: PlanExecuteState):
                         "past_steps": state.get("past_steps", []) + [skip_note],
                         "plan": [],
                     }
+                new_calls.append(current_call)
         # -------------------------------------------------------------------------
     except Exception as e:
-        try:
-            err_text = _is_api_error(e)
-            if not err_text:
-                err_text = f"[ERROR] Executor failed: {e}"
-        except NameError:
-            err_text = f"[ERROR] Executor failed: {e}"
+        error_msg = str(e)
+
+        # if api error, than pause and wait for human to retry
+        if "quota exceeded" in error_msg.lower() or "unavailable" in error_msg.lower():
+            print(f"\n[Safety Stop] API Quota Hit: {error_msg}")
+            return {
+                "crashed": True,
+            }
             
+        # else, simply report error
+        err_text = f"[ERROR] Executor failed: {error_msg}"
         print(f"\n[Executor] {err_text}")
         
-        # Do NOT clear the plan, preserve it so the user can resume this run.
-        # crashed=True signals run_agent() to offer a resume on the next login.
         return {
             "messages": [AIMessage(content=err_text)],
             "response": err_text,
@@ -494,14 +570,137 @@ def execute_node(state: PlanExecuteState):
     return {
         "messages": [HumanMessage(content=f"[Step] {current_step}"), response],
         "executor_steps": state.get("executor_steps", 0) + 1,
+        "executed_tool_calls": state.get("executed_tool_calls", []) + new_calls,
     }
+
 # ---------------------------------------------------------------------------
 # Routing after executor
 # ---------------------------------------------------------------------------
 def check_executor_tools(state: PlanExecuteState):
-    """Route to tools if the executor requested tool calls, else to replan."""
+    """Route to web_gate (HITL) if the executor requested tool calls, else to replan."""
+    if state.get("crashed"):
+        return END
     last_msg = state["messages"][-1] if state["messages"] else None
     if last_msg and getattr(last_msg, "tool_calls", None):
+        return "web_gate"
+    return "replan"
+
+# ---------------------------------------------------------------------------
+# Human-in-the-Loop gate: approve off-allowlist web hosts before searching
+# ---------------------------------------------------------------------------
+def _allowed_hosts(state: PlanExecuteState) -> set:
+    """Hosts the agent may search without asking: the baseline KNOWN_HOSTS plus
+    anything the user already approved this session (persisted in state)."""
+    return set(KNOWN_HOSTS) | set(state.get("approved_hosts") or [])
+
+def web_gate_node(state: PlanExecuteState) -> dict:
+    """
+    Sits between the executor and the ToolNode. Inspects pending `search_web`
+    calls and, if a search would touch a host that is NOT in the known/approved
+    set, pauses the graph (interrupt) and waits for a human decision:
+
+      - approve : run the search and remember the host(s) for this session
+      - edit    : switch the search to a different (allowed) category
+      - cancel  : skip the search; the executor is told it was declined
+
+    Any non-search tool call (DB lookups, cost math, etc.) passes straight
+    through — those are local and safe, so they never interrupt.
+    """
+    last = state["messages"][-1] if state["messages"] else None
+    tool_calls = list(getattr(last, "tool_calls", None) or [])
+    if not tool_calls:
+        return {}
+
+    allowed = _allowed_hosts(state)
+
+    # Flag EVERY search_web call that would touch an off-allowlist host. The
+    # executor may emit up to two tool calls per step, so we must consider all of
+    # them — a single interrupt covers the whole batch (LangGraph re-runs this
+    # node top-to-bottom on resume, so one interrupt() per execution is correct).
+    flagged = []          # list of (tool_call, unknown_hosts)
+    all_unknown = []      # de-duplicated union of unknown hosts, for the prompt
+    category = None       # the (shared) category to offer alternatives for
+    for tc in tool_calls:
+        if tc.get("name") != "search_web":
+            continue
+        cat = (tc.get("args") or {}).get("category", "")
+        unknown = [h for h in hosts_for_category(cat) if h not in allowed]
+        if unknown:
+            flagged.append((tc, unknown))
+            category = category or cat
+            for h in unknown:
+                if h not in all_unknown:
+                    all_unknown.append(h)
+
+    if not flagged:
+        return {}   # nothing to approve — proceed to tools
+
+    flagged_ids = {tc.get("id") for tc, _ in flagged}
+    # Show the hosts for the first flagged category as the "sources" context.
+    hosts = hosts_for_category(category)
+
+    # PAUSE. Everything the terminal UI needs to render the prompt goes in the
+    # payload; the graph state is checkpointed (SqliteSaver) while we wait.
+    decision = interrupt({
+        "type": "web_host_approval",
+        "query": (flagged[0][0].get("args") or {}).get("query", ""),
+        "category": category,
+        "hosts": hosts,
+        "unknown_hosts": all_unknown,
+        "alternatives": [c for c in WEB_CATEGORIES if c != category],
+    })
+
+    action = (decision or {}).get("action", "cancel")
+
+    if action == "approve":
+        # Remember the approved host(s) for the rest of the session so we don't
+        # ask again, then fall through to the tools node unchanged.
+        already = list(state.get("approved_hosts") or [])
+        return {"approved_hosts": already + [h for h in all_unknown if h not in already]}
+
+    if action == "edit":
+        # User chose a different category. Rewrite every flagged call's category
+        # by re-emitting the AIMessage (add_messages dedupes on id, replacing it).
+        new_category = decision.get("category", category)
+        patched_calls = []
+        for c in tool_calls:
+            if c.get("id") in flagged_ids:
+                c = {**c, "args": {**(c.get("args") or {}), "category": new_category}}
+            patched_calls.append(c)
+        new_ai = AIMessage(content=last.content, tool_calls=patched_calls, id=last.id)
+        return {"messages": [new_ai]}
+
+    # action == "cancel": drop every flagged search_web call and answer each with
+    # a synthetic ToolMessage so the conversation stays valid (every tool_call
+    # needs a reply). The executor sees the denial and proceeds without web data.
+    kept_calls = [c for c in tool_calls if c.get("id") not in flagged_ids]
+    new_ai = AIMessage(content=last.content, tool_calls=kept_calls, id=last.id)
+    denials = [
+        ToolMessage(
+            content=(
+                f"[DECLINED BY USER] The web search to "
+                f"{', '.join(hosts_for_category((tc.get('args') or {}).get('category', '')))} "
+                f"was not approved. Proceed using only database tools and "
+                f"already-gathered information; do not retry this search."
+            ),
+            tool_call_id=tc.get("id"),
+            name="search_web",
+        )
+        for tc, _ in flagged
+    ]
+    return {"messages": [new_ai] + denials}
+
+def route_after_gate(state: PlanExecuteState) -> str:
+    """After the gate: go to tools only if approved tool calls remain, else
+    skip straight to replan (e.g. the user cancelled the only pending search)."""
+    last = state["messages"][-1] if state["messages"] else None
+    # If the last message is our denial ToolMessage, look back at the AIMessage.
+    if isinstance(last, ToolMessage):
+        for m in reversed(state["messages"]):
+            if isinstance(m, AIMessage):
+                last = m
+                break
+    if last and getattr(last, "tool_calls", None):
         return "tools"
     return "replan"
 
@@ -513,10 +712,8 @@ def after_tools(state: PlanExecuteState):
     or the replanner will run if the plan is exhausted.
     """
     tool_msgs = [m for m in state["messages"] if isinstance(m, ToolMessage)]
-    summary = _summarise_tool_messages(tool_msgs[-10:])
 
     current_step = state["plan"][0] if state["plan"] else "?"
-    step_record = f"Step '{current_step}': {summary}"
 
     # Isolate just THIS step's tool messages for the console trace (everything
     # after the most recent "[Step] ..." marker), so we don't reprint history.
@@ -528,6 +725,17 @@ def after_tools(state: PlanExecuteState):
         if isinstance(m, ToolMessage):
             step_tool_msgs.append(m)
     step_tool_msgs.reverse()
+
+    called_tools = {m.name for m in step_tool_msgs}
+
+    summary = _summarise_tool_messages(step_tool_msgs)
+    step_record = f"Step '{current_step}': {summary}"
+
+    # Only advance the plan if this step did more than just a location lookup.
+    # If ONLY lookup_location_options ran (no fetch tool yet), stay on the same
+    # step so the executor is re-invoked to complete the fetch.
+    only_lookup_done = called_tools == {"lookup_location_options"}
+    advance_plan = not only_lookup_done
 
     new_cost = _extract_cost(step_tool_msgs)
     total_cost = state.get("calculated_total", 0.0) + new_cost
@@ -541,19 +749,28 @@ def after_tools(state: PlanExecuteState):
 
     for m in step_tool_msgs:
         print(f"      ✓ {m.name}: {_digest_tool_result(m.content)}")
-    last_tool_name = step_tool_msgs[-1].name if step_tool_msgs else None
 
-    advance_plan = last_tool_name != "lookup_location_options"
+    # If a critical fetch failed (flight or hotel search), abort the remaining plan
+    critical_failure = False
+    for m in step_tool_msgs:
+        if m.name in ["fetch_flights", "fetch_hotels"] and isinstance(m.content, str):
+            if m.content.startswith("No flights found") or m.content.startswith("No hotels found"):
+                critical_failure = True
+                break
+
+    next_plan = state["plan"][1:] if advance_plan else state["plan"]
+    if critical_failure:
+        next_plan = []  # Empty the plan to force immediate replanning
 
     return {
         "past_steps": state.get("past_steps", []) + [step_record],
-        "plan": state["plan"][1:] if advance_plan else state["plan"],
+        "plan": next_plan,
         "calculated_total": total_cost,
         "user_preferences": existing_prefs,
     }
 
 # ---------------------------------------------------------------------------
-# Routing after executor
+# Routing after tools
 # ---------------------------------------------------------------------------
 def route_after_tools(state: PlanExecuteState) -> str:
     if _no_match_detected(state["messages"]):
@@ -569,8 +786,11 @@ def no_match_injector_node(state: PlanExecuteState) -> dict:
     lookup tool result, so the replanner cannot hallucinate destinations.
     Clears the remaining plan so the replanner exits with a FinalResponse.
     """
-    # Extract the actual available_locations list from the lookup tool result
+    # Extract the actual available_locations list from the lookup tool result.
+    # lookup_location_options uses batch mode (search_terms: list[str]), so the
+    # result is a dict of {term: {no_direct_match: True, available_locations: [...]}}
     available = []
+    failed_term = "that you searched for"
     for m in state["messages"]:
         if not isinstance(m, ToolMessage):
             continue
@@ -578,15 +798,20 @@ def no_match_injector_node(state: PlanExecuteState) -> dict:
             continue
         try:
             data = json.loads(m.content) if isinstance(m.content, str) else m.content
-            if isinstance(data, dict) and data.get("no_direct_match"):
-                available = data.get("available_locations", [])
+            if isinstance(data, dict):
+                for term, result in data.items():
+                    if isinstance(result, dict) and result.get("no_direct_match"):
+                        available = result.get("available_locations", [])
+                        failed_term = term
+                        break
+            if available:
                 break
         except (json.JSONDecodeError, TypeError):
             pass
 
     avail_str = ", ".join(available) if available else "none found"
     hint = (
-        f"SYSTEM NOTE: The requested destination was NOT found in the database. "
+        f"SYSTEM NOTE: The requested destination '{failed_term}' was NOT found in the database. "
         f"The ONLY real destinations available are: [{avail_str}]. "
         f"Do NOT suggest any destination not in this list. "
         f"Produce a FinalResponse telling the user their destination is unavailable "
@@ -638,6 +863,8 @@ When relaxing constraints or suggesting new destinations, you MUST base your str
 
 DECISION ACTIONS:
 A) Action: FinalResponse
+   - CRITICAL OVERRIDE: If the current plan step explicitly says "Regenerate the final answer using the completed tool results and reflection memory", you MUST choose Action: FinalResponse. DO NOT choose Action: Plan.
+   - Use if reflection memory says the previous draft answer was incomplete, but the required data already exists in completed steps. In that case, do NOT create a new Plan. Regenerate a better FinalResponse using the completed tool results and reflection memory.
    - Use if the original goal is fully met.
    - Use if you successfully found alternatives after relaxing constraints. CRITICAL: You MUST explicitly and clearly state to the user which original constraint was broken (e.g., "I couldn't find a 5-star hotel under $500, but I found this highly-rated option for $800" or "Direct flights were unavailable, so I found an alternative with a connection").
    - Use if you have exhausted all relaxed searches and absolutely nothing is available.
@@ -645,6 +872,13 @@ A) Action: FinalResponse
 B) Action: Plan
    - Use to generate new steps to relax constraints or suggest alternatives when initial searches fail.
    - Be specific: write "Call fetch_hotels in Paris without budget constraint" rather than just "Find alternatives".
+
+CRITICAL PLANNING RULES:
+1. Parallel Execution (Batching): The downstream Executor can use multiple tools simultaneously. You MUST group independent data-gathering tasks into a SINGLE step to save time, but DO NOT exceed 3 tools per step.
+- Good (Multiple locations): "Fetch flights and travel warnings for Tokyo, Paris, and London."
+- Good (Multiple services): "Fetch flights and hotels for Tokyo."
+- Bad (Too slow): Step 1: "Fetch flights to Tokyo", Step 2: "Fetch flights to Paris", Step 3: "Fetch hotels in Tokyo".
+2. Do NOT create separate lookup_location_options steps. The Executor will do location lookup automatically before calling any fetch tools.
 """
 
 def replan_node(state: PlanExecuteState):
@@ -725,10 +959,19 @@ def replan_node(state: PlanExecuteState):
     )
     tool_descriptions = "\n".join([f"- {t.name}: {t.description.splitlines()[0]}" for t in tools])
 
+    reflection_block = ""
+    if state.get("reflection_memory"):
+        reflection_block = (
+            "Reflection memory from previous failed attempts in this same task:\n"
+            + "\n".join(f"- {m}" for m in state["reflection_memory"] if m)
+        )
+
     prompt = (
-        REPLANNER_SYSTEM.format(tool_descriptions=tool_descriptions) + "\n\n"        f"{history_context}\n\n"
+        REPLANNER_SYSTEM.format(tool_descriptions=tool_descriptions) + "\n\n"
+        f"{history_context}\n\n"
         f"Original goal: {state['input']}\n\n"
         f"Completed steps:\n{past_steps_text}\n\n"
+        f"{reflection_block}\n\n"
         f"Remaining planned steps:\n{remaining_text}\n\n"
         f"{budget_note}\n\n"
         "What should happen next? Evaluate carefully and choose the correct action schema."
@@ -741,7 +984,7 @@ def replan_node(state: PlanExecuteState):
         err_text = _is_api_error(e) or f"[ERROR] Replanner failed: {e}"
         print(f"\n[Replanner] {err_text}")
         # Preserve whatever plan remains so the user can resume later.
-        return {"response": err_text, "crashed": True, "replan_count": replan_count}
+        return {"crashed": True, "replan_count": replan_count}
 
     print(f"\n[Replanner] Decision: {type(result.action).__name__}")
 
@@ -750,8 +993,30 @@ def replan_node(state: PlanExecuteState):
         budget_warn = ""
         if budget > 0 and total_cost > budget:
             budget_warn = f"\n\n⚠️  BUDGET ALERT: Estimated ${total_cost:.2f} exceeds your ${budget:.2f} limit."
+            # SIF-2: pause and ask user before delivering over-budget result
+            sif_delta = maybe_sif2_budget_interrupt(state, budget, total_cost)
+            if sif_delta is not None:
+                # User chose approve / new_budget / cancel — let the delta
+                # propagate back; replan_node returns early so the graph
+                # re-routes on the updated state.
+                return {**sif_delta, "replan_count": replan_count}
+
+        final_text = result.action.response + budget_warn
+
+        # TEST ONLY: create an incomplete draft once, so the Critic can catch it.
+        # This simulates a bad final draft while keeping the collected tool data valid.
+        if (
+            "critic_demo" in state["input"].lower()
+            and state.get("critic_count", 0) == 0
+        ):
+            print("[TEST] Creating incomplete final draft for Critic demo.")
+            final_text = (
+                "I found flights for Paris, but I did not include the requested hotel "
+                "details or the safety information that was already collected."
+            )
+
         return {
-            "response": result.action.response + budget_warn,
+            "response": final_text,
             "plan": [],
             "replan_count": replan_count,
             "over_budget": budget > 0 and total_cost > budget,
@@ -768,21 +1033,232 @@ def replan_node(state: PlanExecuteState):
     for i, s in enumerate(new_steps, 1):
         print(f"  {i}. {s}")
 
+    # Reset cost if the replanner flagged a destination change
+    new_total = 0.0 if getattr(result.action, "reset_cost", False) else total_cost
+    if getattr(result.action, "reset_cost", False):
+        print("[Replanner] 🔄 Destination change detected - resetting previous trip costs.")
+
     return {
         "plan": new_steps,
         "replan_count": replan_count,
+        "calculated_total": new_total,
         "response": ""
     }
 # ---------------------------------------------------------------------------
 # Routing after replan
 # ---------------------------------------------------------------------------
 def should_end(state: PlanExecuteState) -> str:
+    if state.get("crashed"):
+        return END
     if state.get("response"):
         return "formatter"
     if not state.get("plan"):
         # Plan is empty but no response yet — force replan to generate one
         return "replan"
+    # Check SIF level. If a new plan exists and SIF is 1, go to approval gate.
+    if get_sif(state) == 1:
+        return "sif_plan_gate"
     return "execute"
+
+# ---------------------------------------------------------------------------
+# Node: critic
+# ---------------------------------------------------------------------------
+CRITIC_SYSTEM = """You are a Travel Plan Critic.
+
+Your job is to review the DRAFT final response before the user sees it.
+You are NOT an executor and you must NOT call tools directly.
+You must critique only using:
+1. The user's original request.
+2. The completed tool results in past_steps.
+3. The Past conversation context (chat_history).
+4. The draft final response.
+
+Do NOT invent new requirements that are unrelated to the travel request.
+
+CRITICAL RULE FOR MISSING DATA:
+- If the user asks for information that was successfully fetched and presented AFTER the "--- [NEW LOGIN: OLD DATA EXPIRED] ---" marker (or if no marker exists), consider it FULFILLED. 
+- Do NOT demand new tool steps. If the information was only found BEFORE the marker, you MUST demand a new fetch step.
+
+ASSIGNMENT FOCUS:
+
+1. Destination suitability:
+- Verify that the selected destination matches the user's request.
+- Use the completed tool results as evidence, not only the wording of the final answer.
+- Examples of user constraints: warm destination, beach destination, family-friendly destination, specific destination, safe destination, travel warnings.
+- If the user requested a specific type of destination and there is no evidence that the selected destination matches it, fail.
+- If the selected destination contradicts the user's request, fail.
+
+2. Destination safety / travel warning:
+- Review the completed tool results for travel warnings, travel advisories, security alerts, elevated risk, unsafe destination, or similar wording.
+- If no safety search was performed at all for the selected/requested destination, fail and return this single data-gathering fix_step:
+  Search for travel warnings for the selected destination using search_web with category=news.
+- If the results explicitly mention a travel warning or elevated risk for the destination, fail unless the draft clearly warns the user about it.
+- If safety information exists and shows no warning, this criterion passes.
+
+3. Quality and style:
+- Verify that the final answer is professional, clear, and service-oriented.
+- Verify that the requested concrete details appear in the answer.
+- If the user requested flights, hotels, activities, restaurants, prices, or times, check that those details appear or that missing data is clearly explained.
+
+FIX STEP POLICY:
+
+Choose the fix_step based on the type of problem:
+
+A. Missing data problem:
+- If the required information does NOT exist in completed tool results, return exactly ONE executable data-gathering step.
+- Examples: fetch_hotels in Paris, fetch_restaurants in Paris, search_web category=news for Paris travel warnings.
+
+B. Bad draft / missing-from-answer problem:
+- If the required information already EXISTS in completed tool results but is missing from the draft final response, do NOT request another fetch/search tool.
+- Return exactly this fix_step:
+  Regenerate the final answer using the completed tool results and reflection memory.
+
+OUTPUT RULES:
+
+If the answer is acceptable:
+- passed = True
+- issues = []
+- fix_steps = []
+- reflection = ""
+
+If the answer is not acceptable:
+- passed = False
+- issues = specific problems
+- fix_steps = exactly ONE concrete step according to the FIX STEP POLICY
+- reflection = one short lesson for the next attempt
+
+Never return an empty fix_steps list when passed=False.
+"""
+
+def critic_node(state: PlanExecuteState):
+    critic_count = state.get("critic_count", 0) + 1
+    draft_response = state.get("response", "") or ""
+
+    # Check max cycles
+    if critic_count > MAX_CRITIC_CYCLES:
+        print(f"\n[Critic] ⚠️  Critic limit reached — allowing final answer.")
+        return {
+            "critic_passed": True,
+            "critic_count": critic_count,
+        }
+
+    past_steps_text = "\n".join(state.get("past_steps", [])) or "(none)"
+    memory_text = "\n".join(f"- {m}" for m in state.get("reflection_memory", []) if m) or "(none)"
+    history_text = state.get("chat_history", "") or "(none)"
+
+    prompt = (
+        f"{CRITIC_SYSTEM}\n\n"
+        f"Original user request:\n{state['input']}\n\n"
+        f"Completed tool/execution steps:\n{past_steps_text}\n\n"
+        f"Past conversation context:\n{history_text}\n\n"
+        f"Reflection memory so far:\n{memory_text}\n\n"
+        f"Draft final response:\n{state.get('response', '')}\n\n"
+        "Evaluate the draft answer now."
+    )
+
+    try:
+        result = critic_model.invoke(prompt)
+    except Exception as e:
+        err_text = _is_api_error(e) or f"[ERROR] Critic failed: {e}"
+        print(f"\n[Critic] API Quota Hit or Failure: {err_text}")
+        return {
+            "crashed": True,
+            "critic_count": critic_count,
+        }
+
+    print("\n[Critic] Decision:", "PASS ✅" if result.passed else "FAIL")
+
+    if result.issues:
+        print("[Critic] Issues found:")
+        for issue in result.issues:
+            print(f"  - {issue}")
+
+    if result.passed:
+        return {
+            "critic_passed": True,
+            "critic_count": critic_count,
+        }
+
+    new_memory = list(state.get("reflection_memory", []))
+    if result.reflection:
+        new_memory.append(result.reflection)
+    elif result.issues:
+        new_memory.append("Previous attempt failed: " + "; ".join(result.issues))
+
+    clean_fix_steps = [s.strip() for s in result.fix_steps if s and s.strip()]
+
+    if not clean_fix_steps:
+        clean_fix_steps = [
+            "Collect the missing destination safety/suitability information using the appropriate available tool."
+        ]
+
+    # Keep only one step to avoid burning quota.
+    clean_fix_steps = clean_fix_steps[:1]
+
+    # If the model still returns a writing/editing instruction, convert it into
+    # a Replanner-friendly regeneration step instead of sending it to Executor.
+    writing_markers = ["add ", "update ", "include ", "mention ", "write ", "rewrite "]
+    if any(clean_fix_steps[0].lower().startswith(m) for m in writing_markers):
+        clean_fix_steps = [
+            "Regenerate the final answer using the completed tool results and reflection memory."
+        ]
+
+    print("[Critic] Reflection memory updated:")
+    for m in new_memory:
+        print(f"  - {m}")
+
+    print("[Critic] Sending agent back with fix step:")
+    print(f"  1. {clean_fix_steps[0]}")
+
+    return {
+        "critic_passed": False,
+        "critic_count": critic_count,
+        "reflection_memory": new_memory,
+        "plan": clean_fix_steps,
+        "response": "",
+    }
+
+def route_after_critic(state: PlanExecuteState) -> str:
+    if state.get("crashed"):
+        return END
+    
+    if state.get("critic_passed"):
+        return "formatter"
+
+    plan = state.get("plan") or []
+    if not plan:
+        return "replan"
+
+    step = plan[0].lower()
+
+    # If the Critic says the data already exists and only the final answer
+    # needs regeneration, send back to the Replanner, not to the Executor.
+    regenerate_markers = [
+        "regenerate the final answer",
+        "completed tool results",
+        "reflection memory",
+    ]
+    if any(marker in step for marker in regenerate_markers):
+        return "replan"
+
+    # Data-gathering fix steps should go to the Executor.
+    executable_markers = [
+        "fetch_",
+        "fetch ",
+        "search_web",
+        "search for",
+        "check travel warnings",
+        "find_",
+        "find ",
+        "calculate",
+        "lookup",
+    ]
+    if any(marker in step for marker in executable_markers):
+        return "execute"
+
+    # Unknown or writing-like step: let the Replanner turn it into a final answer
+    # or a concrete executable plan, rather than burning quota in the Executor.
+    return "replan"
 
 # ---------------------------------------------------------------------------
 # Node: formatter  (Session 4 report style)
@@ -790,17 +1266,19 @@ def should_end(state: PlanExecuteState) -> str:
 def formatter_node(state: PlanExecuteState):
     raw = state.get("response", "")
 
-    # Derive destination from past steps / input
+    # Derive destination from tool arguments (Search REVERSED to get the latest)
     city = "YOUR DESTINATION"
-    for step in state.get("past_steps", []):
-        m = re.search(r"fetch_flights.*?destination['\"]?\s*[:=]\s*['\"]?([A-Za-z ]+)", step, re.IGNORECASE)
-        if m:
-            city = m.group(1).strip().title()
-            break
-        m2 = re.search(r"fetch_hotels.*?city['\"]?\s*[:=]\s*['\"]?([A-Za-z ]+)", step, re.IGNORECASE)
-        if m2:
-            city = m2.group(1).strip().title()
-            break
+    for m in reversed(state.get("messages", [])):
+        if hasattr(m, "tool_calls") and m.tool_calls:
+            for tc in m.tool_calls:
+                if tc.get("name") in ["fetch_flights", "find_connecting_flights"] and tc.get("args", {}).get("destination"):
+                    city = tc["args"]["destination"].strip().title()
+                    break
+                elif tc.get("name") == "fetch_hotels" and tc.get("args", {}).get("city"):
+                    city = tc["args"]["city"].strip().title()
+                    break
+            if city != "YOUR DESTINATION":
+                break
 
     total = state.get("calculated_total", 0.0)
     budget = state.get("total_budget", 0.0)
@@ -835,7 +1313,7 @@ def formatter_node(state: PlanExecuteState):
     new_history = current_history + f"User: {state['input']}\nAgent: {raw.strip()}\n\n"
 
     return {
-        "response": report, 
+        "response": report,
         "chat_history": new_history  # Save to DB via SqliteSaver
     }
 
@@ -846,31 +1324,63 @@ builder = StateGraph(PlanExecuteState)
 
 builder.add_node("planner",           plan_node)
 builder.add_node("execute",           execute_node)
+builder.add_node("web_gate",          web_gate_node)
 builder.add_node("tools",             ToolNode(tools))
 builder.add_node("after_tools_node",  after_tools)
 builder.add_node("no_match_injector", no_match_injector_node)
 builder.add_node("replan",            replan_node)
+builder.add_node("critic",            critic_node)
 builder.add_node("formatter",         formatter_node)
+builder.add_node("sif_plan_gate",         sif_plan_gate_node)
+builder.add_node("sif_alternatives_gate", sif_alternatives_gate_node)
 
-builder.add_edge(START,     "planner")
-builder.add_edge("planner", "execute")
+
+builder.add_edge(START, "planner")
+# SIF-1: conditionally gate the plan before execution
+builder.add_conditional_edges(
+    "planner", route_after_planner,
+    {"sif_plan_gate": "sif_plan_gate", "execute": "execute", END: END},
+)
+builder.add_conditional_edges(
+    "sif_plan_gate", route_after_plan_gate,
+    {"execute": "execute", END: END},
+)
 
 builder.add_conditional_edges(
     "execute", check_executor_tools,
+    {"web_gate": "web_gate", "replan": "replan", END: END},
+)
+
+# Human-in-the-loop gate: may interrupt for host approval before any web search.
+builder.add_conditional_edges(
+    "web_gate", route_after_gate,
     {"tools": "tools", "replan": "replan"},
 )
 
-builder.add_edge("tools",             "after_tools_node")
+builder.add_edge("tools", "after_tools_node")
 
 builder.add_conditional_edges(
-    "after_tools_node", route_after_tools,
-    {"execute": "execute", "replan": "replan", "no_match": "no_match_injector"},
+    "after_tools_node", route_after_tools_sif,
+    {"execute": "execute", "replan": "replan",
+      "no_match": "no_match_injector", "sif_alternatives_gate": "sif_alternatives_gate"},
 )
+
 builder.add_edge("no_match_injector", "replan")
+
+# SIF-2 Gate A: after the alternatives prompt, always go to replan
+builder.add_conditional_edges(
+    "sif_alternatives_gate", route_after_alternatives_gate,
+    {"replan": "replan"},
+)
 
 builder.add_conditional_edges(
     "replan", should_end,
-    {"execute": "execute", "formatter": "formatter", "replan": "replan"},
+    {"execute": "execute", "formatter": "critic",
+     "replan": "replan", "sif_plan_gate": "sif_plan_gate", END: END},
+)
+builder.add_conditional_edges(
+    "critic", route_after_critic,
+    {"execute": "execute", "formatter": "formatter", "replan": "replan", END: END},
 )
 
 builder.add_edge("formatter", END)
@@ -892,21 +1402,189 @@ PROGRESS_MAP = {
     "after_tools_node":  "📊  Processing tool results...",
     "no_match_injector": "💡  Destination not found — searching for alternatives...",
     "replan":            "🔄  Reviewing progress and re-evaluating plan...",
+    "critic":            "🧪  Critic is checking the draft answer and reflection memory...",
     # "formatter":         "✨  Formatting final report...",
 }
 
+
+def _prompt_user_question(payload: dict) -> str:
+    """Render an interactive clarifying-question prompt (from the ask_user tool)
+    and return the user's answer string. Supports numbered options plus
+    free-text; an empty answer is allowed and passed back to the agent."""
+    question = (payload.get("question") or "").strip()
+    options  = payload.get("options") or []
+
+    print("\n" + "═" * 62)
+    print("💬  THE AGENT NEEDS YOUR INPUT")
+    print("═" * 62)
+    print(f"  {question}")
+    if options:
+        print("-" * 62)
+        for i, opt in enumerate(options, 1):
+            print(f"    {i}. {opt}")
+        print("-" * 62)
+        print("  Pick a number, or just type your own answer.")
+    print("═" * 62)
+
+    prompt = f"  Your answer [1-{len(options)} or text]: " if options else "  Your answer: "
+    raw = input(prompt).strip()
+
+    # A bare number selects the matching option; anything else is free-text.
+    if options and raw.isdigit() and 1 <= int(raw) <= len(options):
+        chosen = options[int(raw) - 1]
+        print(f"  ✅  You chose: {chosen}\n")
+        return chosen
+
+    if raw:
+        print(f"  ✅  Noted: {raw}\n")
+    else:
+        print("  (No answer given — the agent will proceed with its best guess.)\n")
+    return raw
+
+
+def _prompt_host_approval(payload: dict) -> dict:
+    """Render the interactive approve/edit/cancel prompt for a web-host
+    approval interrupt and return the user's decision dict (the resume value)."""
+    query   = payload.get("query", "")
+    category = payload.get("category", "")
+    unknown = payload.get("unknown_hosts", [])
+    hosts   = payload.get("hosts", [])
+    alts    = payload.get("alternatives", [])
+
+    print("\n" + "═" * 62)
+    print("⏸️   HUMAN APPROVAL NEEDED — web search to an unapproved host")
+    print("═" * 62)
+    print(f"  The agent wants to run a web search:")
+    print(f"    • query    : {query}")
+    print(f"    • category : {category}")
+    print(f"    • sources  : {', '.join(hosts) or '(none)'}")
+    print(f"  ⚠️  Not on the known-hosts allowlist: {', '.join(unknown)}")
+    print("-" * 62)
+    print("  [a] Approve  — search these source(s) (remembered for this session)")
+    print("  [e] Edit     — switch to a different, trusted category")
+    print("  [c] Cancel   — skip this search; let the agent continue without it")
+    print("═" * 62)
+
+    while True:
+        choice = input("  Your choice [a/e/c]: ").strip().lower()
+        if choice in ("a", "approve"):
+            print(f"  ✅  Approved — searching {', '.join(unknown)}.\n")
+            return {"action": "approve"}
+        if choice in ("c", "cancel", ""):
+            print("  🚫  Cancelled — the agent will proceed without this search.\n")
+            return {"action": "cancel"}
+        if choice in ("e", "edit"):
+            if not alts:
+                print("  (No alternative categories available — pick a or c.)")
+                continue
+            print("  Choose a replacement category:")
+            for i, c in enumerate(alts, 1):
+                print(f"    {i}. {c}  ({', '.join(hosts_for_category(c))})")
+            sel = input(f"  Category number [1-{len(alts)}]: ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(alts):
+                new_cat = alts[int(sel) - 1]
+                print(f"  ✏️   Switched to '{new_cat}'.\n")
+                return {"action": "edit", "category": new_cat}
+            print("  Invalid selection — try again.")
+            continue
+        print("  Please enter 'a', 'e', or 'c'.")
+
+
+def _resume_value_for(payload: dict):
+    """Map an interrupt payload to the right interactive prompt and return the
+    value the graph should be resumed with."""
+    kind = (payload or {}).get("type")
+    if kind == "user_question":
+        return _prompt_user_question(payload)      # -> str (the user's answer)
+    if kind == "web_host_approval":
+        return _prompt_host_approval(payload)      # -> dict ({"action": ...})
+    # SIF gates — dispatch to handlers defined in sif.py
+    if kind in SIF_INTERRUPT_HANDLERS:
+        return SIF_INTERRUPT_HANDLERS[kind](payload)
+    # Unknown interrupt type — fail safe by cancelling/skipping.
+    print(f"  (Unrecognised approval request: {kind!r} — skipping.)")
+    return {"action": "cancel"}
+
+
+def _run_with_hitl(initial_state, config):
+    """Stream the graph, transparently handling human-in-the-loop interrupts:
+    when the graph pauses (host approval or a clarifying question), prompt the
+    user and resume with Command(resume=...), looping until the run completes
+    with no interrupt."""
+    stream_input = initial_state
+    while True:
+        interrupted = False
+        for chunk in graph.stream(stream_input, config, stream_mode="updates"):
+            if not chunk:
+                continue
+            # LangGraph surfaces a pause under the "__interrupt__" key.
+            if "__interrupt__" in chunk:
+                intr = chunk["__interrupt__"]
+                payload = intr[0].value if isinstance(intr, (list, tuple)) else intr.value
+                stream_input = Command(resume=_resume_value_for(payload))
+                interrupted = True
+                break
+            for node_name in chunk:
+                if node_name in PROGRESS_MAP:
+                    print(PROGRESS_MAP[node_name])
+        if not interrupted:
+            break
+
+
+SIF_DESCRIPTIONS = {
+    "1": "LOW   — approve every plan before execution",
+    "2": "MEDIUM — offer search narrowing + confirm budget breaches",
+    "3": "HIGH  — autonomous (only web-host approval interrupts)",
+}
+
+def _handle_sif_menu(graph, config: dict) -> None:
+    """Interactive SIF settings menu, triggered by '/' in the main loop.
+
+    Reads the current SIF from user_preferences, shows the menu, and
+    writes the updated value back via graph.update_state so SqliteSaver
+    persists it across sessions.
+    """
+    try:
+        current_state = graph.get_state(config)
+        prefs = dict((current_state.values or {}).get("user_preferences") or {})
+    except Exception:
+        prefs = {}
+
+    current_sif = prefs.get("sif", "3")
+
+    print("\n" + "═" * 62)
+    print("⚙️   AGENT SETTINGS — Self-Independence Factor (SIF)")
+    print("═" * 62)
+    print(f"  Current SIF: {current_sif}  ({SIF_DESCRIPTIONS.get(current_sif, '?')})\n")
+    for key, desc in SIF_DESCRIPTIONS.items():
+        marker = "◀" if key == current_sif else " "
+        print(f"  {key}. {desc}  {marker}")
+    print("-" * 62)
+    print("  Press Enter to keep current setting.")
+    print("═" * 62)
+
+    choice = input("  New SIF level [1/2/3]: ").strip()
+    if choice in ("1", "2", "3") and choice != current_sif:
+        prefs["sif"] = choice
+        graph.update_state(config, {"user_preferences": prefs})
+        print(f"  ✅  SIF updated to {choice} ({SIF_DESCRIPTIONS[choice]}).\n")
+    elif choice == current_sif:
+        print(f"  (SIF unchanged — still {current_sif}.)\n")
+    else:
+        print("  (No change.)\n")
+
 def run_agent():
     print(BANNER)
-    print("Plan-and-Execute travel agent — session 5.\n")
+    print("Plan-and-Execute travel agent — session 6.\n")
 
     thread_id = input("Enter Session ID (e.g., student_01): ").strip() or "default"
     config = {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": MAX_REPLAN_CYCLES * MAX_EXECUTOR_STEPS * 4,
+        # "recursion_limit": MAX_REPLAN_CYCLES * MAX_EXECUTOR_STEPS * 4,
     }
 
     # Load / initialise state
-    has_crashed_run = False
+    has_crashed = False
     try:
         existing = graph.get_state(config)
         if not existing or not existing.values:
@@ -921,14 +1599,19 @@ def run_agent():
                 "calculated_total": 0.0,
                 "over_budget": False,
                 "user_preferences": {},
+                "chat_history": "",
+                "reflection_memory": [],
+                "critic_passed": False,
+                "critic_count": 0,
                 "messages": [],
+                "approved_hosts": [],
                 "crashed": False,
             })
         else:
             sv = existing.values
             prefs = sv.get("user_preferences") or {}
 
-            # Detect a crash 
+            # Detect a crash from a previous session
             has_crashed = bool(sv.get("crashed"))
             if has_crashed:
                 remaining = sv.get("plan", [])
@@ -952,7 +1635,12 @@ def run_agent():
     except Exception as e:
         print(f"Note during session init: {e}")
 
+    sif_level = (graph.get_state(config).values or {}).get("user_preferences", {}).get("sif", "3")
+    print(f"[SIF] Autonomy level: {sif_level} — {SIF_DESCRIPTIONS.get(sif_level, '')}  (type '/' to change)\n")
+
     print("Let's plan your trip! (type 'quit' to exit)\n")
+    
+    is_first_prompt = True
 
     while True:
         try:
@@ -963,7 +1651,12 @@ def run_agent():
                 print("Goodbye — safe travels!")
                 break
 
-            #  Resume crashed run
+            # '/' opens the SIF settings menu
+            if user_input == "/":
+                _handle_sif_menu(graph, config)
+                continue
+
+            # Resume crashed run
             RESUME_WORDS = {"continue", "resume", "c"}
             if user_input.strip().lower() in RESUME_WORDS:
                 try:
@@ -976,7 +1669,7 @@ def run_agent():
                     remaining = sv.get("plan", [])
                     step_name = remaining[0] if remaining else "Finalizing Summary"
                     print(f"\n[Resume] ▶  Continuing from step: \"{step_name}\"\n")
-                    
+
                     initial_state: PlanExecuteState = {
                         "input":            sv["input"],
                         "plan":             remaining,
@@ -988,27 +1681,53 @@ def run_agent():
                         "calculated_total": sv.get("calculated_total", 0.0),
                         "over_budget":      False,
                         "user_preferences": sv.get("user_preferences", {}),
-                        "messages":         [],        # ← fresh; avoids loop-guard false positives
+                        "messages":         [],        # fresh; avoids loop-guard false positives
                         "chat_history":     sv.get("chat_history", ""),
+                        "reflection_memory": sv.get("reflection_memory", []),
+                        "critic_passed":    False,
+                        "critic_count":     sv.get("critic_count", 0),
+                        "approved_hosts":   sv.get("approved_hosts", []),
                         "crashed":          True,      # plan_node checks this flag
+                        "executed_tool_calls": sv.get("executed_tool_calls", []),
                     }
                     has_crashed = False
+                    is_first_prompt = False
                 else:
                     print("ℹ️  No interrupted run found. Please enter a new request.\n")
                     continue
 
             else:
-                # Carry over user preferences from previous turn
+                # Carry over user preferences, session host approvals and chat history
                 try:
                     prev_state = graph.get_state(config)
                     saved_prefs = (prev_state.values or {}).get("user_preferences") or {}
+                    saved_chat_history = (prev_state.values or {}).get("chat_history") or ""
+                    saved_hosts = (prev_state.values or {}).get("approved_hosts") or []
+                    
+                    if is_first_prompt:
+                        # NEW LOGIN: Wipe the execution memory so the agent is allowed to 
+                        # re-fetch fresh data for the exact same destinations.
+                        if saved_chat_history:
+                            saved_chat_history += "\n=== HISTORICAL SESSION ARCHIVE ABOVE — USE FOR CONVERSATIONAL REFERENCE ===\n"
+                        saved_past_steps = []
+                        saved_messages = []
+                        saved_tool_calls = []
+                    else:
+                        # SAME SESSION (Follow-up question): Keep the raw tool data and 
+                        # duplicate guards active so it doesn't re-fetch unnecessarily.
+                        saved_past_steps = (prev_state.values or {}).get("past_steps") or []
+                        saved_messages = (prev_state.values or {}).get("messages") or []
+                        saved_tool_calls = (prev_state.values or {}).get("executed_tool_calls") or []
+
                 except Exception:
-                    saved_prefs = {}
+                    saved_prefs, saved_hosts = {}, []
+                    saved_chat_history = ""
+                    saved_past_steps, saved_messages, saved_tool_calls = [], [], []
 
                 initial_state: PlanExecuteState = {
                     "input":          user_input,
                     "plan":           [],
-                    "past_steps":     [],
+                    "past_steps":     saved_past_steps,
                     "response":       "",
                     "executor_steps": 0,
                     "replan_count":   0,
@@ -1016,19 +1735,20 @@ def run_agent():
                     "calculated_total": 0.0,
                     "over_budget":    False,
                     "user_preferences": saved_prefs,
-                    "messages":       [],
-                    "chat_history":     (prev_state.values or {}).get("chat_history", ""),
-                    "crashed":          False,
+                    "chat_history":   saved_chat_history,
+                    "reflection_memory": [],
+                    "critic_passed":  False,
+                    "critic_count":   0,
+                    "messages":       saved_messages,
+                    "approved_hosts": list(saved_hosts),
+                    "crashed":        False,
+                    "executed_tool_calls": saved_tool_calls,
                 }
+                is_first_prompt = False
 
-            print("Searching...")
+            print("\nSearching...\n")
 
-            for chunk in graph.stream(initial_state, config, stream_mode="updates"):
-                if not chunk:
-                    continue
-                for node_name, _ in chunk.items():
-                    if node_name in PROGRESS_MAP:
-                        print(PROGRESS_MAP[node_name])
+            _run_with_hitl(initial_state, config)
 
         except KeyboardInterrupt:
             print("\nGoodbye — safe travels!")
