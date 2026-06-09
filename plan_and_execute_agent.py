@@ -305,8 +305,16 @@ CRITICAL RULES FOR PLANNING:
 5. Do Not use all the available tools just for the sake of it. Only include tools that are relevant to the user's request. Irrelevant steps waste time and risk hitting token limits.
 6. Simplicity: Maximum 6 steps. Keep step descriptions concise and focused on the data needed. Do not plan formatting or summarization steps (the system handles the final output automatically).
 
-- Always include a step: "Check travel warnings for [destination] using search_web with category=news"
-- Place this step early, before the final cost calculation.
+Only include a travel warnings / safety news step when the user is planning a trip, flight, hotel etc.,
+or explicitly asks about safety, warnings, risks, news, strikes, closures, or current events.
+
+Do NOT add travel warnings for simple factual questions such as:
+- current weather
+- time difference
+- exchange rate
+- visa-only question
+
+If the user only asks for weather, answer only the weather request.
 
 Do NOT create separate lookup_location_options steps.
 The Executor will do lookup automatically.
@@ -707,7 +715,7 @@ def after_tools(state: PlanExecuteState):
 
     advance_plan = not only_lookup_done
 
-    new_cost = _extract_cost(tool_msgs)
+    new_cost = _extract_cost(step_tool_msgs)
     total_cost = state.get("calculated_total", 0.0) + new_cost
 
     existing_prefs = dict(state.get("user_preferences") or {})
@@ -1026,10 +1034,13 @@ ASSIGNMENT FOCUS
 - Examples of user constraints: warm destination, beach destination, family-friendly destination, specific destination, safe destination, travel warnings.
 - If the user requested a specific type of destination and there is no evidence that the selected destination matches it, fail.
 - If the selected destination contradicts the user's request, fail.
+- For narrow factual requests, only check that the answer refers to the correct destination or subject.
 
 2. Destination safety / travel warning:
-- Review the completed tool results for travel warnings, travel advisories, security alerts, elevated risk, unsafe destination, or similar wording.
-- If no safety search was performed at all for the selected/requested destination, fail and return this single data-gathering fix_step:
+- This criterion is mandatory ONLY for TRAVEL DECISION REQUESTS or when the user explicitly asks about safety, travel warnings, risks, current events, protests, strikes, closures, advisories, or security concerns.
+- For NON-TRAVEL-INFORMATION REQUESTS, skip this criterion completely and never fail solely because safety information is missing.
+- For requests where safety validation is required, review the completed tool results for travel warnings, travel advisories, security alerts, elevated risk, unsafe destination, or similar wording.
+- If safety validation is required and no safety search was performed at all for the selected/requested destination, fail and return this single data-gathering fix_step:
   Search for travel warnings for the selected destination using search_web with category=news.
 - If the results explicitly mention a travel warning or elevated risk for the destination, fail unless the draft clearly warns the user about it.
 - If safety information exists and shows no warning, this criterion passes.
@@ -1037,7 +1048,9 @@ ASSIGNMENT FOCUS
 3. Quality and style:
 - Verify that the final answer is professional, clear, and service-oriented.
 - Verify that the requested concrete details appear in the answer.
-- If the user requested flights, hotels, activities, restaurants, prices, or times, check that those details appear or that missing data is clearly explained.
+- If the user requested flights, hotels, activities, restaurants, prices, weather, exchange rate, visa details, or times, check that those details appear or that missing data is clearly explained.
+- If the user asked for "now", "current", or "today", do not accept purely typical/seasonal information as a complete answer unless the answer clearly explains that current data was unavailable.
+- Do not require unrelated trip-planning details that the user did not ask for.
 
 FIX STEP POLICY
 
@@ -1045,7 +1058,13 @@ Choose the fix_step based on the type of problem:
 
 A. Missing data problem:
 - If the required information does NOT exist in completed tool results, return exactly ONE executable data-gathering step.
-- Examples: fetch_hotels in Paris, fetch_restaurants in Paris, search_web category=news for Paris travel warnings.
+- Examples:
+  fetch_hotels in Paris
+  fetch_restaurants in Paris
+  fetch_activities in Paris
+  fetch_flights from TLV to Paris
+  search_web category=weather for current weather in Paris
+  search_web category=news for Paris travel warnings
 
 B. Bad draft / missing-from-answer problem:
 - If the required information already EXISTS in completed tool results but is missing from the draft final response, do NOT request another fetch/search tool.
@@ -1203,8 +1222,31 @@ def route_after_critic(state: PlanExecuteState) -> str:
 # Node: formatter  (Session 4 report style)
 # ---------------------------------------------------------------------------
 
+
+
+def _is_trip_request(user_input: str) -> bool:
+    req = (user_input or "").lower()
+
+    trip_words = [
+        "trip", "travel plan", "full trip", "vacation", "holiday",
+        "itinerary", "plan me", "plan a trip",
+        "טיול", "חופשה", "מסלול", "תכנון טיול",
+    ]
+
+    return any(w in req for w in trip_words)
+
 def formatter_node(state: PlanExecuteState):
     raw = state.get("response", "")
+
+    if not _is_trip_request(state.get("input", "")):
+        current_history = state.get("chat_history", "")
+        new_history = current_history + f"User: {state['input']}\nAgent: {raw.strip()}\n\n"
+
+        return {
+            "response": raw.strip(),
+            "chat_history": new_history,
+        }
+
 
     # Derive destination from past steps / input
     city = "YOUR DESTINATION"
@@ -1243,7 +1285,7 @@ def formatter_node(state: PlanExecuteState):
     print("\n" + "=" * 40)
     print(report)
     print("=" * 40 + "\n")
-    
+
     # -------------------------------------------------------------------------
     # MEMORY UPDATE: Append the current interaction to the chat history
     # -------------------------------------------------------------------------
@@ -1251,10 +1293,9 @@ def formatter_node(state: PlanExecuteState):
     new_history = current_history + f"User: {state['input']}\nAgent: {raw.strip()}\n\n"
 
     return {
-        "response": report, 
-        "chat_history": new_history  # Save to DB via SqliteSaver
+        "response": report,
+        "chat_history": new_history,
     }
-
 
 
 # ---------------------------------------------------------------------------
@@ -1514,6 +1555,900 @@ def _handle_sif_menu(graph, config: dict) -> None:
         print(f"  (SIF unchanged — still {current_sif}.)\n")
     else:
         print("  (No change.)\n")
+
+def process_request(
+    user_input: str,
+    thread_id: str = "default",
+    progress_callback=None,
+    interrupt_callback=None,
+) -> dict:
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": MAX_REPLAN_CYCLES * MAX_EXECUTOR_STEPS * 4,
+    }
+
+    logs = []
+
+    try:
+        existing = graph.get_state(config)
+
+        if not existing or not existing.values:
+            graph.update_state(config, {
+                "input": "",
+                "plan": [],
+                "past_steps": [],
+                "response": "",
+                "executor_steps": 0,
+                "replan_count": 0,
+                "total_budget": 0.0,
+                "calculated_total": 0.0,
+                "over_budget": False,
+                "user_preferences": {},
+                "chat_history": "",
+                "reflection_memory": [],
+                "critic_passed": False,
+                "critic_count": 0,
+                "messages": [],
+                "approved_hosts": [],
+            })
+
+            saved_prefs = {}
+            saved_chat_history = ""
+        else:
+            saved_prefs = (existing.values or {}).get("user_preferences") or {}
+            saved_chat_history = (existing.values or {}).get("chat_history") or ""
+
+    except Exception:
+        saved_prefs = {}
+        saved_chat_history = ""
+
+    initial_state: PlanExecuteState = {
+        "input": user_input,
+        "plan": [],
+        "past_steps": [],
+        "response": "",
+        "executor_steps": 0,
+        "replan_count": 0,
+        "total_budget": _extract_budget(user_input),
+        "calculated_total": 0.0,
+        "over_budget": False,
+        "user_preferences": saved_prefs,
+        "chat_history": saved_chat_history,
+        "reflection_memory": [],
+        "critic_passed": False,
+        "critic_count": 0,
+        "messages": [],
+        "approved_hosts": [],
+    }
+
+    final_response = ""
+    existing_message_count = 0
+    try:
+        before_state = graph.get_state(config)
+        existing_message_count = len((before_state.values or {}).get("messages") or [])
+    except Exception:
+        existing_message_count = 0
+
+    stream_input = initial_state
+
+    while True:
+        interrupted = False
+
+        for chunk in graph.stream(stream_input, config, stream_mode="updates"):
+            if not chunk:
+                continue
+
+            if "__interrupt__" in chunk:
+                intr = chunk["__interrupt__"]
+                payload = intr[0].value if isinstance(intr, (list, tuple)) else intr.value
+
+                if interrupt_callback:
+                    decision = interrupt_callback(payload)
+                else:
+                    decision = {"action": "cancel"}
+
+                stream_input = Command(resume=decision)
+                interrupted = True
+                break
+
+            for node_name, node_update in chunk.items():
+                if node_name in PROGRESS_MAP:
+                    log = PROGRESS_MAP[node_name]
+                    logs.append(log)
+
+                    if progress_callback:
+                        progress_callback(log)
+
+                if isinstance(node_update, dict) and node_update.get("response"):
+                    final_response = node_update["response"]
+
+        if not interrupted:
+            break
+
+    if not final_response:
+        try:
+            state = graph.get_state(config)
+            final_response = (state.values or {}).get("response", "")
+        except Exception:
+            final_response = ""
+
+    try:
+        final_state = graph.get_state(config)
+        final_values = final_state.values or {}
+    except Exception:
+        final_values = {}
+    return {
+        "response": final_response or "I finished processing, but no final response was generated.",
+        "structured_data": build_structured_data_from_messages(
+            (final_values.get("messages", []) or [])[existing_message_count:],
+            final_response,
+            user_input,
+        ),
+        "logs": logs,
+        }
+
+
+def filter_structured_data_by_request(data: dict, user_request: str) -> dict:
+    """
+    Full trip request -> keep all relevant categories.
+    Specific/non-trip request -> keep only requested categories.
+
+    This prevents a follow-up like "EUR to ILS" from showing old flight/hotel cards.
+    """
+    req = (user_request or "").lower()
+
+    def has_any(words):
+        return any(w in req for w in words)
+
+    trip_words = [
+        "trip", "travel plan", "full trip", "vacation", "holiday",
+        "itinerary", "plan me", "plan a trip", "travel to",
+        "weekend in", "weekend trip", "city break",
+        "טיול", "חופשה", "תכנון טיול", "מסלול",
+    ]
+
+    flight_words = ["flight", "flights", "fly", "טיסה", "טיסות"]
+    hotel_words = ["hotel", "hotels", "stay", "accommodation", "מלון", "מלונות"]
+    activity_words = ["activity", "activities", "things to do", "attraction", "attractions", "פעילות", "אטרקציות"]
+    restaurant_words = ["restaurant", "restaurants", "food", "eat", "מסעדה", "מסעדות"]
+    car_words = ["car rental", "rent a car", "rental car", "car", "רכב", "השכרת רכב"]
+
+    bookable_count = sum([
+        has_any(flight_words),
+        has_any(hotel_words),
+        has_any(activity_words),
+        has_any(restaurant_words),
+        has_any(car_words),
+    ])
+
+    is_full_trip = has_any(trip_words) or bookable_count >= 2
+
+    if is_full_trip:
+        return data
+
+    keep = {"destination"}
+
+    if has_any(flight_words):
+        keep.add("flights")
+
+    if has_any(hotel_words):
+        keep.add("hotels")
+
+    if has_any(activity_words):
+        keep.add("activities")
+
+    if has_any(restaurant_words):
+        keep.add("restaurants")
+
+    if has_any(car_words):
+        keep.add("car_rentals")
+
+    if has_any(["visa", "ויזה"]):
+        keep.add("visa")
+
+    if has_any(["time difference", "time zone", "שעה", "הפרש שעות"]):
+        keep.add("time_difference")
+
+    if has_any(["currency", "exchange", "exchange rate", "rate", "convert", "ils", "usd", "eur", "מטבע", "שער", "המרה"]):
+        keep.add("currency_exchange")
+
+    if has_any(["transport", "metro", "bus", "public transport", "תחבורה", "מטרו", "אוטובוס"]):
+        keep.add("transport_info")
+
+    if has_any(["season", "best time", "עונה"]):
+        keep.add("seasonal_recommendations")
+
+    if has_any(["warning", "safety", "danger", "news", "advisory", "אזהרה", "בטיחות", "מסוכן"]):
+        keep.add("warning")
+
+    if has_any(["cost", "price", "budget", "total", "עלות", "מחיר", "תקציב"]):
+        keep.add("estimated_cost")
+
+    if keep == {"destination"}:
+        return {}
+
+    return {
+        key: value
+        for key, value in data.items()
+        if key in keep and value
+    }
+
+def get_session_preferences(thread_id: str = "default") -> dict:
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": MAX_REPLAN_CYCLES * MAX_EXECUTOR_STEPS * 4,
+    }
+
+    try:
+        state = graph.get_state(config)
+        prefs = dict((state.values or {}).get("user_preferences") or {})
+    except Exception:
+        prefs = {}
+
+    prefs.setdefault("sif", "3")
+    return prefs
+
+def set_session_sif(thread_id: str, sif: str) -> dict:
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": MAX_REPLAN_CYCLES * MAX_EXECUTOR_STEPS * 4,
+    }
+
+    state = graph.get_state(config)
+    prefs = dict((state.values or {}).get("user_preferences") or {})
+
+    if sif not in ("1", "2", "3"):
+        raise ValueError("SIF must be 1, 2, or 3")
+
+    prefs["sif"] = sif
+    graph.update_state(config, {"user_preferences": prefs})
+    return prefs
+
+def build_structured_data_from_messages(
+    messages: list,
+    final_text: str = "",
+    user_request: str = "",
+) -> dict:
+    """
+    Hybrid + stable structured-data builder.
+
+    Stable cards:
+    - Flights / hotels / activities / car rentals / restaurants come from ToolMessage results.
+
+    Natural text:
+    - Visa / time difference / seasonal recommendations / warning / estimated cost
+      are taken from the final LLM answer when available, because those sections
+      read better as natural language.
+
+    This avoids parsing flights/hotels from free text, but still keeps the
+    explanatory sections friendly.
+    """
+    import json
+    import re
+    from langchain_core.messages import ToolMessage
+
+    data = {
+        "destination": "",
+        "flights": [],
+        "hotels": [],
+        "activities": [],
+        "car_rentals": [],
+        "restaurants": [],
+        "visa": "",
+        "time_difference": "",
+        "currency_exchange": "",
+        "seasonal_recommendations": "",
+        "transport_info": "",
+        "warning": "",
+        "estimated_cost": "",
+        "notes": "",
+    }
+
+    def parse_content(content):
+        if isinstance(content, (list, dict)):
+            return content
+        if isinstance(content, str):
+            try:
+                return json.loads(content)
+            except Exception:
+                return content
+        return content
+
+    def as_list(value):
+        return value if isinstance(value, list) else []
+
+    def clean_text(value):
+        value = str(value or "")
+        value = re.sub(r"\*\*", "", value)
+        value = re.sub(r"=+", "", value)
+        value = re.sub(r"\s+", " ", value)
+        return value.strip(" .;:\n\t-*")
+
+    def split_amenities(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(x).strip() for x in value if str(x).strip()]
+        return [x.strip() for x in str(value).split(",") if x.strip()]
+
+    def unique_by(records, key):
+        out = []
+        seen = set()
+        for r in records:
+            value = str(r.get(key, "")).strip().lower()
+            if value and value not in seen:
+                seen.add(value)
+                out.append(r)
+        return out
+
+    def extract_web_answer(text: str) -> str:
+        """
+        search_web returns a raw block with ANSWER + sources.
+        For GUI cards we keep only ANSWER when possible.
+        """
+        text = str(text or "").strip()
+        m = re.search(r"ANSWER:\s*(.*?)(?=\n\d+\.|\Z)", text, re.I | re.S)
+        if m:
+            answer = clean_text(m.group(1))
+        else:
+            answer = text.split("Source:")[0]
+            answer = re.sub(r"Web search results for .*?:", "", answer, flags=re.I)
+            answer = clean_text(answer)
+
+        # Remove URLs/sources and keep warning readable.
+        answer = re.sub(r"https?://\S+", "", answer)
+        answer = re.split(r"\bSource:\b|\s+\d+\.\s+", answer, maxsplit=1, flags=re.I)[0]
+        answer = clean_text(answer)
+        return answer[:650]
+
+    def extract_final_text_sections(text: str) -> dict:
+        """
+        Robust narrative-section extractor.
+
+        Goal:
+        - Keep cards from tools: flights/hotels/activities/restaurants/cars.
+        - Keep natural narrative from the LLM: visa/time/currency/transport/season/warning/cost.
+        - Prevent leakage, for example:
+            Time Difference -> Currency
+            City Transport -> Recommended Restaurants
+            Seasonal Recommendations -> Restaurants
+            Warning -> Sources/raw results
+        """
+        raw = str(text or "")
+        raw = re.sub(r"\r\n?", "\n", raw)
+
+        def normalize_title(title: str) -> str:
+            title = clean_text(title).lower()
+            title = re.sub(r"\s+", " ", title)
+            return title.strip()
+
+        def classify_title(title: str):
+            """
+            Return:
+            - canonical key for sections we want to display as narrative cards
+            - "__border__" for sections that should only stop previous text
+            - None for non-section titles like "Air France"
+            """
+            t = normalize_title(title)
+
+            # Sections saved as narrative text
+            if "visa" in t:
+                return "visa"
+
+            if "time difference" in t or "time zone" in t:
+                return "time_difference"
+
+            if (
+                "currency" in t
+                or "exchange rate" in t
+                or t in {"exchange", "rate"}
+            ):
+                return "currency_exchange"
+
+            if "season" in t or "best time" in t:
+                return "seasonal_recommendations"
+
+            if (
+                "warning" in t
+                or "advisory" in t
+                or "safety" in t
+                or "risk" in t
+            ):
+                return "warning"
+
+            if (
+                "transport" in t
+                or "transportation" in t
+                or "metro" in t
+                or "public transit" in t
+                or "bus network" in t
+            ):
+                return "transport_info"
+
+            if (
+                "estimated trip cost" in t
+                or "estimated cost" in t
+                or "trip cost" in t
+                or "total cost" in t
+            ):
+                return "estimated_cost"
+
+            # Sections rendered from tool cards only.
+            # They are borders to stop leakage but are not saved here.
+            border_keywords = [
+                "flight", "hotel", "accommodation", "activity", "activities",
+                "attraction", "restaurant", "food", "car rental", "car rentals",
+                "rental car", "beach", "shopping", "local tips", "notes",
+                "additional information", "recommended restaurants",
+                "recommended hotels", "recommended flights",
+                "recommended activities",
+            ]
+            if any(k in t for k in border_keywords):
+                return "__border__"
+
+            return None
+
+        # Candidate headings:
+        #   **Title:**
+        #   Title:
+        #   Title (details):
+        #   . Title:
+        # Avoid very long captures so normal sentences are not treated as headings.
+        heading_pattern = re.compile(
+            r"(?i)(?:^|\n|\.\s+|\*\*\s*)\s*"
+            r"(?:[-*]\s*)?"
+            r"([A-Z][A-Za-z /&-]{2,60})"
+            r"(?:\s*\([^)]{0,80}\))?"
+            r"\s*:\s*(?:\*\*)?",
+            re.S,
+        )
+
+        matches = []
+        for m in heading_pattern.finditer(raw):
+            title = m.group(1)
+            key = classify_title(title)
+            if key:
+                matches.append((m, key))
+
+        sections = {}
+
+        for i, (m, key) in enumerate(matches):
+            start = m.end()
+            end = matches[i + 1][0].start() if i + 1 < len(matches) else len(raw)
+
+            content = raw[start:end]
+            content = re.split(
+                r"\n\s*=+\s*\n|\n\s*ESTIMATED TOTAL COST\s*:",
+                content,
+                maxsplit=1,
+                flags=re.I,
+            )[0]
+
+            content = clean_text(content)
+
+            # Remove common assistant closing text if it leaks into a card.
+            content = re.sub(
+                r"\b(?:Do you|Would you|Let me know|If you need).*?$",
+                "",
+                content,
+                flags=re.I,
+            ).strip()
+
+            if not content:
+                continue
+
+            # Border-only sections stop the previous section but are not saved.
+            if key == "__border__":
+                continue
+
+            # Defensive guard:
+            # Avoid treating car-rental "Budget: 55/day, Compact..." as Estimated Trip Cost.
+            if key == "estimated_cost":
+                if not re.search(r"[$€₪]|\btotal\b|\bcost\b|\bestimated\b", content, re.I):
+                    continue
+
+            # Warning/search cleanup: remove raw sources and URLs.
+            if key == "warning":
+                content = re.sub(r"https?://\S+", "", content)
+                content = re.split(
+                    r"\bSource:\b|\s+\d+\.\s+",
+                    content,
+                    maxsplit=1,
+                    flags=re.I,
+                )[0]
+                content = clean_text(content)
+                content = content[:650]
+
+            sections[key] = content
+
+        return sections
+
+
+    # -------------------------
+    # 1. Collect real tool data
+    # -------------------------
+    for msg in messages:
+        if not isinstance(msg, ToolMessage):
+            continue
+
+        tool_name = getattr(msg, "name", "")
+        result = parse_content(msg.content)
+
+        if tool_name == "fetch_flights":
+            for r in as_list(result):
+                if not isinstance(r, dict):
+                    continue
+                item = {
+                    "airline": clean_text(r.get("airline")),
+                    "price": r.get("price"),
+                    "flight": clean_text(r.get("flight_number")),
+                    "destination": clean_text(r.get("destination")),
+                    "duration": clean_text(r.get("duration_hours")),
+                    "departure": clean_text(r.get("departure_time")),
+                    "arrival": clean_text(r.get("arrival_time")),
+                }
+                data["flights"].append(item)
+                if not data["destination"] and item["destination"]:
+                    data["destination"] = item["destination"]
+
+        elif tool_name == "find_connecting_flights":
+            for r in as_list(result):
+                if not isinstance(r, dict):
+                    continue
+                data["flights"].append({
+                    "airline": f'{r.get("airline_1", "")} + {r.get("airline_2", "")}'.strip(" +"),
+                    "price": r.get("total_price"),
+                    "flight": f'{r.get("flight_1", "")} → {r.get("flight_2", "")}'.strip(" →"),
+                    "destination": clean_text(r.get("final_destination")),
+                    "duration": "",
+                    "departure": "",
+                    "arrival": "",
+                    "layover": clean_text(r.get("layover")),
+                })
+                if not data["destination"] and r.get("final_destination"):
+                    data["destination"] = clean_text(r.get("final_destination"))
+
+        elif tool_name in ("fetch_hotels", "find_hotels_by_amenity"):
+            for r in as_list(result):
+                if not isinstance(r, dict):
+                    continue
+                amenities = split_amenities(r.get("amenities"))
+                room_type = clean_text(r.get("room_type"))
+                if room_type and room_type not in amenities:
+                    amenities.append(room_type)
+
+                data["hotels"].append({
+                    "name": clean_text(r.get("name")),
+                    "price": r.get("price_per_night"),
+                    "stars": r.get("stars") or 0,
+                    "amenities": amenities,
+                    "rating": r.get("rating", ""),
+                    "room_type": room_type,
+                    "breakfast_included": r.get("breakfast_included", ""),
+                })
+
+        elif tool_name == "fetch_activities":
+            for r in as_list(result):
+                if not isinstance(r, dict):
+                    continue
+                data["activities"].append({
+                    "name": clean_text(r.get("name")),
+                    "price": r.get("price"),
+                    "category": clean_text(r.get("category")),
+                    "duration": clean_text(r.get("duration")),
+                    "suitability": clean_text(r.get("suitable_for")),
+                })
+
+        elif tool_name == "fetch_car_rental_agencies":
+            for r in as_list(result):
+                if not isinstance(r, dict):
+                    continue
+                data["car_rentals"].append({
+                    "company": clean_text(r.get("company")),
+                    "location": clean_text(r.get("airport")),
+                    "price": r.get("price_per_day"),
+                    "type": clean_text(r.get("car_type")),
+                    "transmission": clean_text(r.get("transmission")),
+                    "seats": r.get("seats", ""),
+                })
+
+        elif tool_name == "fetch_restaurants":
+            for r in as_list(result):
+                if not isinstance(r, dict):
+                    continue
+                data["restaurants"].append({
+                    "name": clean_text(r.get("name")),
+                    "cuisine": clean_text(r.get("cuisine")),
+                    "price_level": clean_text(r.get("price_level")),
+                    "rating": r.get("rating", ""),
+                    "special_features": clean_text(r.get("special_features")),
+                })
+
+        elif tool_name == "fetch_visa_requirements":
+            rows = as_list(result)
+            if rows and isinstance(rows[0], dict):
+                r = rows[0]
+                policy = clean_text(r.get("policy"))
+                days = r.get("days_allowed_without_visa", "")
+                visa_type = clean_text(r.get("visa_type"))
+                parts = []
+                if policy:
+                    parts.append(policy)
+                if days not in ("", None):
+                    parts.append(f"Days allowed without visa: {days}")
+                if visa_type:
+                    parts.append(f"Visa type: {visa_type}")
+                data["visa"] = ". ".join(parts)
+
+        elif tool_name == "fetch_time_difference":
+            rows = as_list(result)
+            if rows and isinstance(rows[0], dict):
+                hours = rows[0].get("hours_difference")
+                if hours is not None:
+                    data["time_difference"] = f"{hours} hours"
+
+        elif tool_name == "fetch_currency_exchange_rate":
+            rows = as_list(result)
+            if rows and isinstance(rows[0], dict):
+                rate = rows[0].get("exchange_rate")
+                if rate is not None:
+                    data["currency_exchange"] = f"Exchange rate: {rate}"
+
+        elif tool_name == "fetch_seasonal_recommendations":
+            rows = as_list(result)
+            if rows and isinstance(rows[0], dict):
+                r = rows[0]
+                data["seasonal_recommendations"] = (
+                    f"{clean_text(r.get('best_season'))} "
+                    f"({clean_text(r.get('ideal_months'))}): "
+                    f"{clean_text(r.get('reason'))}"
+                ).strip()
+
+        elif tool_name == "fetch_city_transport_info":
+            rows = as_list(result)
+            if rows and isinstance(rows[0], dict):
+                r = rows[0]
+                transport_type = clean_text(r.get("transport_type"))
+                ticket = r.get("average_ticket_price", "")
+                car_needed = r.get("car_needed", "")
+                notes = clean_text(r.get("notes"))
+                parts = []
+                if transport_type:
+                    parts.append(f"Transport: {transport_type}")
+                if ticket not in ("", None):
+                    parts.append(f"Average ticket: {ticket}")
+                if car_needed not in ("", None):
+                    parts.append(f"Car needed: {car_needed}")
+                if notes:
+                    parts.append(notes)
+                data["transport_info"] = ". ".join(parts)
+
+        elif tool_name == "calculate_trip_cost":
+            if isinstance(result, dict):
+                total = result.get("total_estimate")
+                currency = clean_text(result.get("currency"))
+                if total is not None:
+                    data["estimated_cost"] = f"{total} {currency}".strip()
+
+        elif tool_name == "search_web":
+            text = clean_text(result)
+            low = text.lower()
+            if any(w in low for w in ["warning", "safety", "unrest", "violence", "strike", "arrest", "police", "advisory"]):
+                data["warning"] = extract_web_answer(text)
+
+    data["flights"] = unique_by(data["flights"], "flight")
+    data["hotels"] = unique_by(data["hotels"], "name")
+    data["activities"] = unique_by(data["activities"], "name")
+    data["car_rentals"] = unique_by(data["car_rentals"], "company")
+    data["restaurants"] = unique_by(data["restaurants"], "name")
+
+    # Cards selection stays deterministic.
+    data = select_relevant_items_for_gui(data, user_request, final_text)
+
+    # -------------------------
+    # 2. Override narrative sections from LLM final text
+    # -------------------------
+    narrative = extract_final_text_sections(final_text)
+    if final_text:
+        text = re.sub(r"\s+", " ", final_text)
+
+        if not narrative.get("time_difference"):
+            m = re.search(
+                r"([^.]*?(?:ahead of|behind)[^.]*\.)",
+                text,
+                re.I,
+            )
+            if m:
+                narrative["time_difference"] = clean_text(m.group(1))
+
+        if not narrative.get("seasonal_recommendations"):
+            m = re.search(
+                r"(The best season to visit .*?\.)",
+                text,
+                re.I,
+            )
+            if m:
+                narrative["seasonal_recommendations"] = clean_text(m.group(1))
+
+        if not narrative.get("warning"):
+            m = re.search(
+                r"((?:Recent reports|Recent news reports|Following|As of).*?(?:caution|conditions|safety|trip)\.)",
+                text,
+                re.I,
+            )
+            if m:
+                narrative["warning"] = clean_text(m.group(1))
+
+        if not narrative.get("visa"):
+            m = re.search(
+                r"(No visa .*?\.)",
+                text,
+                re.I,
+            )
+            if m:
+                narrative["visa"] = clean_text(m.group(1))
+    for key in [
+        "visa",
+        "time_difference",
+        "currency_exchange",
+        "seasonal_recommendations",
+        "transport_info",
+        "warning",
+        "estimated_cost",
+    ]:
+        if narrative.get(key):
+            data[key] = narrative[key]
+
+    data = filter_structured_data_by_request(data, user_request)
+    return data
+
+def select_relevant_items_for_gui(data: dict, user_request: str = "", final_text: str = "") -> dict:
+    """
+    Deterministic selector.
+
+    This keeps the GUI stable while still respecting requests like:
+    - cheap / budget / זול
+    - luxury / 5-star / spa
+    - family
+    - all options
+    """
+    import re
+
+    request = (user_request or "").lower()
+    final_lower = (final_text or "").lower()
+
+    cheap_words = [
+        "cheap", "cheapest", "budget", "low cost", "low-cost", "affordable",
+        "זול", "הכי זול", "תקציב", "חסכוני"
+    ]
+    luxury_words = [
+        "luxury", "5 star", "5-star", "five star", "spa", "deluxe",
+        "יוקרתי", "5 כוכבים", "חמישה כוכבים", "ספא"
+    ]
+    family_words = [
+        "family", "kids", "children", "families",
+        "משפחה", "ילדים"
+    ]
+    all_words = [
+        "all options", "all the options", "show all", "all flights", "all hotels",
+        "כל האפשרויות", "הכל", "כל הטיסות", "כל המלונות"
+    ]
+
+    wants_cheap = any(w in request for w in cheap_words)
+    wants_luxury = any(w in request for w in luxury_words)
+    wants_family = any(w in request for w in family_words)
+    wants_all = any(w in request for w in all_words)
+
+    def numeric_price(item):
+        value = item.get("price")
+        try:
+            return float(value)
+        except Exception:
+            return float("inf")
+
+    def mentioned_filter(items, name_keys):
+        """
+        If the final answer explicitly mentions item names, keep only those.
+        This makes cards match what the agent actually recommended.
+        """
+        if not final_lower:
+            return items
+
+        mentioned = []
+        for item in items:
+            names = []
+            for key in name_keys:
+                value = str(item.get(key, "")).strip()
+                if value:
+                    names.append(value)
+
+            if any(name.lower() in final_lower for name in names):
+                mentioned.append(item)
+
+        # Only use this filter if it found something.
+        return mentioned if mentioned else items
+
+    def limit_default(items, limit=3):
+        return items if wants_all else items[:limit]
+
+    # First align with final answer names where possible
+    data["flights"] = mentioned_filter(data.get("flights", []), ["airline", "flight"])
+    data["hotels"] = mentioned_filter(data.get("hotels", []), ["name"])
+    data["activities"] = mentioned_filter(data.get("activities", []), ["name"])
+    data["car_rentals"] = mentioned_filter(data.get("car_rentals", []), ["company"])
+    data["restaurants"] = mentioned_filter(data.get("restaurants", []), ["name"])
+
+    # Then apply explicit user constraints
+    if wants_cheap:
+        if data["flights"]:
+            data["flights"] = sorted(data["flights"], key=numeric_price)[:1]
+        if data["hotels"]:
+            data["hotels"] = sorted(data["hotels"], key=numeric_price)[:1]
+        if data["activities"]:
+            data["activities"] = sorted(data["activities"], key=numeric_price)[:3]
+        if data["car_rentals"]:
+            data["car_rentals"] = sorted(data["car_rentals"], key=numeric_price)[:1]
+        if data["restaurants"]:
+            # price_level is text, so prefer cheap/moderate if present.
+            preferred = [
+                r for r in data["restaurants"]
+                if str(r.get("price_level", "")).lower() in ("cheap", "moderate", "low", "budget")
+            ]
+            data["restaurants"] = preferred or data["restaurants"][:2]
+
+    elif wants_luxury:
+        if data["hotels"]:
+            luxury_hotels = [
+                h for h in data["hotels"]
+                if int(h.get("stars") or 0) >= 5
+                or any("spa" in str(a).lower() or "deluxe" in str(a).lower() for a in h.get("amenities", []))
+                or "deluxe" in str(h.get("room_type", "")).lower()
+            ]
+            data["hotels"] = luxury_hotels or sorted(
+                data["hotels"],
+                key=lambda h: (int(h.get("stars") or 0), float(h.get("rating") or 0)),
+                reverse=True,
+            )[:1]
+
+        if data["restaurants"]:
+            luxury_restaurants = [
+                r for r in data["restaurants"]
+                if str(r.get("price_level", "")).lower() in ("expensive", "luxury", "high")
+                or "fine" in str(r.get("special_features", "")).lower()
+            ]
+            data["restaurants"] = luxury_restaurants or data["restaurants"][:2]
+
+    elif wants_family:
+        if data["activities"]:
+            family_activities = [
+                a for a in data["activities"]
+                if "family" in str(a.get("suitability", "")).lower()
+                or "children" in str(a.get("suitability", "")).lower()
+                or "kids" in str(a.get("suitability", "")).lower()
+            ]
+            data["activities"] = family_activities or data["activities"][:3]
+
+        if data["car_rentals"]:
+            family_cars = []
+            for c in data["car_rentals"]:
+                try:
+                    seats = int(c.get("seats") or 0)
+                except Exception:
+                    seats = 0
+                if seats >= 5 or "suv" in str(c.get("type", "")).lower():
+                    family_cars.append(c)
+            data["car_rentals"] = family_cars or data["car_rentals"][:2]
+
+    else:
+        # Default: do not overwhelm the GUI.
+        data["flights"] = limit_default(data.get("flights", []), 3)
+        data["hotels"] = limit_default(data.get("hotels", []), 3)
+        data["activities"] = limit_default(data.get("activities", []), 3)
+        data["car_rentals"] = limit_default(data.get("car_rentals", []), 3)
+        data["restaurants"] = limit_default(data.get("restaurants", []), 3)
+
+    return data
+
 
 def run_agent():
     print(BANNER)
