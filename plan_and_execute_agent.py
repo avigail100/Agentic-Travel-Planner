@@ -1239,11 +1239,17 @@ def formatter_node(state: PlanExecuteState):
     raw = state.get("response", "")
 
     if not _is_trip_request(state.get("input", "")):
+        clean_response = raw.strip()
+
+        print("\n" + "=" * 40)
+        print(clean_response)
+        print("=" * 40 + "\n")
+
         current_history = state.get("chat_history", "")
-        new_history = current_history + f"User: {state['input']}\nAgent: {raw.strip()}\n\n"
+        new_history = current_history + f"User: {state['input']}\nAgent: {clean_response}\n\n"
 
         return {
-            "response": raw.strip(),
+            "response": clean_response,
             "chat_history": new_history,
         }
 
@@ -1864,6 +1870,84 @@ def build_structured_data_from_messages(
         value = re.sub(r"\s+", " ", value)
         return value.strip(" .;:\n\t-*")
 
+    def tool_display_name(tool_name: str) -> str:
+        """Convert a tool name to a user-friendly generic title."""
+        name = str(tool_name or "").strip()
+
+        prefixes = (
+            "fetch_", "find_", "calculate_", "convert_", "lookup_", "save_"
+        )
+        for prefix in prefixes:
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+
+        return name.replace("_", " ").strip().title() or "Tool Result"
+
+    def append_note(text: str):
+        """Append a note once. Notes are rendered by the GUI as a Notes card."""
+        text = clean_text(text)
+        if not text:
+            return
+
+        existing = data.get("notes", "") or ""
+        existing_lines = [line.strip() for line in existing.splitlines() if line.strip()]
+        if text not in existing_lines:
+            existing_lines.append(text)
+        data["notes"] = "\n".join(existing_lines)
+
+    def is_missing_tool_result(tool_name: str, result) -> bool:
+        """Generic detector for empty / unavailable / failed tool results."""
+        # lookup_location_options is an internal preparation tool. A no-match there
+        # is often resolved by the executor, so do not show it as a user-facing note.
+        if tool_name == "lookup_location_options":
+            return False
+
+        if result is None:
+            return True
+
+        if isinstance(result, list):
+            return len(result) == 0
+
+        if isinstance(result, dict):
+            return bool(
+                result.get("error")
+                or result.get("no_results")
+                or result.get("not_found")
+                or result.get("no_direct_match")
+            )
+
+        text = str(result or "").strip().lower()
+        if not text:
+            return True
+
+        missing_markers = [
+            "no available",
+            "no availability",
+            "no results",
+            "no result",
+            "not found",
+            "no direct match",
+            "unable to find",
+            "could not find",
+            "cannot find",
+            "error invoking tool",
+            "failed",
+        ]
+        return any(marker in text for marker in missing_markers)
+
+    def missing_note_for_tool(tool_name: str, result) -> str:
+        """Create a generic note for any tool that returned no usable data."""
+        title = tool_display_name(tool_name)
+        text = clean_text(result)
+
+        # Keep the note generic, but include a short original reason when useful.
+        if "error invoking tool" in text.lower():
+            return f"{title}: the tool failed, so this information could not be displayed."
+
+        return f"{title}: no available information was found."
+
+
     def split_amenities(value):
         if value is None:
             return []
@@ -2073,6 +2157,10 @@ def build_structured_data_from_messages(
 
         tool_name = getattr(msg, "name", "")
         result = parse_content(msg.content)
+
+        if is_missing_tool_result(tool_name, result):
+            append_note(missing_note_for_tool(tool_name, result))
+            continue
 
         if tool_name == "fetch_flights":
             for r in as_list(result):
@@ -2298,9 +2386,13 @@ def build_structured_data_from_messages(
     ]:
         if narrative.get(key):
             data[key] = narrative[key]
-
-    data = filter_structured_data_by_request(data, user_request)
-    return data
+    # Do not hide cards that were actually found by tools.
+    # If the agent found flight/hotel/etc. — always show them as cards.
+    return {
+        key: value
+        for key, value in data.items()
+        if value
+    }
 
 def select_relevant_items_for_gui(data: dict, user_request: str = "", final_text: str = "") -> dict:
     """
