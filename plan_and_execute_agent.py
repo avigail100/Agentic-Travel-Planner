@@ -136,6 +136,19 @@ class CriticResult(BaseModel):
     )
 
 
+class SupervisorDecision(BaseModel):
+    """Supervisor-Router decision: which specialist agent handles the current step."""
+    agent: str = Field(
+        description=(
+            "Which specialist agent should execute this step. "
+            "Must be one of: 'transport', 'wellbeing', 'tech'."
+        )
+    )
+    reason: str = Field(
+        description="One-line justification for the routing decision."
+    )
+
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -176,7 +189,51 @@ _base_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, 
 planner_model   = _base_model.with_structured_output(Plan)
 replanner_model = _base_model.with_structured_output(ReplanAction)
 critic_model    = _base_model.with_structured_output(CriticResult)
-executor_model  = _base_model.bind_tools(tools)
+executor_model  = _base_model.bind_tools(tools)  # kept as fallback
+
+# ---------------------------------------------------------------------------
+# Multi-Agent: per-domain tool subsets
+# ---------------------------------------------------------------------------
+
+TRANSPORT_TOOLS = [
+    fetch_flights,
+    fetch_hotels,
+    fetch_visa_requirements,
+    find_connecting_flights,
+    fetch_car_rental_agencies,
+    lookup_location_options,
+    fetch_city_transport_info,
+    calculate_trip_cost,
+    suggest_alternatives,
+    ask_user,
+]
+
+WELLBEING_TOOLS = [
+    fetch_activities,
+    fetch_seasonal_recommendations,
+    fetch_restaurants,
+    fetch_beaches,
+    find_hotels_by_amenity,
+    find_destinations_by_preference,
+    lookup_location_options,
+    ask_user,
+]
+
+TECH_TOOLS = [
+    fetch_currency_exchange_rate,
+    convert_cost_to_origin_currency,
+    fetch_time_difference,
+    convert_time_to_destination_timezone,
+    search_web,
+    save_preference,
+    lookup_location_options,
+    ask_user,
+]
+
+transport_model  = _base_model.bind_tools(TRANSPORT_TOOLS)
+wellbeing_model  = _base_model.bind_tools(WELLBEING_TOOLS)
+tech_model       = _base_model.bind_tools(TECH_TOOLS)
+supervisor_model = _base_model.with_structured_output(SupervisorDecision)
 
 
 
@@ -411,7 +468,194 @@ def plan_node(state: PlanExecuteState):
     # }
 
 # ---------------------------------------------------------------------------
-# Node: executor
+# Node: supervisor_router  (Multi-Agent routing)
+# ---------------------------------------------------------------------------
+
+SUPERVISOR_SYSTEM = """You are a routing supervisor for a multi-agent travel assistant.
+Your ONLY job is to examine the current execution step and decide which specialist
+agent is best equipped to handle it.
+
+SPECIALIST AGENTS AND THEIR DOMAINS:
+
+• transport — Handles logistics, transportation, and accommodation:
+  fetch_flights, fetch_hotels, fetch_visa_requirements, find_connecting_flights,
+  fetch_car_rental_agencies, fetch_city_transport_info, calculate_trip_cost,
+  suggest_alternatives
+
+• wellbeing — Handles experiences, activities, dining, and lifestyle:
+  fetch_activities, fetch_seasonal_recommendations, fetch_restaurants,
+  fetch_beaches, find_hotels_by_amenity, find_destinations_by_preference
+
+• tech — Handles financial calculations, time conversions, web search, and preferences:
+  fetch_currency_exchange_rate, convert_cost_to_origin_currency,
+  fetch_time_difference, convert_time_to_destination_timezone,
+  search_web, save_preference
+
+ROUTING RULES:
+1. Read the current step and pick the single most relevant agent.
+2. If the step mentions flights, hotels, car rentals, or visas → transport
+3. If the step mentions activities, restaurants, beaches, or experiences → wellbeing
+4. If the step mentions currency, time zones, web search, or exchange rates → tech
+5. Mixed steps (e.g. "Fetch flights and activities"): pick the agent whose tools are
+   listed FIRST in the step, or default to 'transport' for ambiguous logistics.
+6. Never invent agents. Always return exactly one of: transport, wellbeing, tech.
+"""
+
+
+def supervisor_router_node(state: PlanExecuteState) -> Command:
+    """
+    Reads the current step from the plan and routes to the appropriate
+    specialist sub-agent node via a Command(goto=...).
+    Falls back to 'execute_fallback' if routing fails.
+    """
+    if not state.get("plan"):
+        # Nothing to route — let the normal flow handle it
+        return Command(goto="replan")
+
+    current_step = state["plan"][0]
+
+    prompt = (
+        f"{SUPERVISOR_SYSTEM}\n\n"
+        f"Current step to route: {current_step}\n\n"
+        "Return your routing decision."
+    )
+
+    try:
+        decision = supervisor_model.invoke(prompt)
+        agent = decision.agent.strip().lower()
+        if agent not in ("transport", "wellbeing", "tech"):
+            raise ValueError(f"Unknown agent: {agent!r}")
+        print(f"\n[Router] Routing step '{current_step[:60]}…' → {agent.upper()} agent  ({decision.reason})")
+        goto_map = {
+            "transport": "transport_executor",
+            "wellbeing": "wellbeing_executor",
+            "tech":      "tech_executor",
+        }
+        return Command(goto=goto_map[agent])
+    except Exception as e:
+        print(f"\n[Router] Routing failed ({e}) — falling back to generic executor.")
+        return Command(goto="execute_fallback")
+
+
+# ---------------------------------------------------------------------------
+# Helper: shared executor logic (used by all three specialist nodes + fallback)
+# ---------------------------------------------------------------------------
+
+def _run_executor(state: PlanExecuteState, model, agent_system: str, agent_label: str) -> dict:
+    """
+    Shared execution logic for all specialist sub-agents.
+    Identical to the original execute_node body but uses the passed model
+    and prepends agent_system to the prompt so each specialist stays focused.
+    """
+    if not state["plan"]:
+        return {}
+
+    current_step = state["plan"][0]
+
+    past_tool_calls: set = set()
+    for msg in state.get("messages", []):
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                args_str = json.dumps(tc.get("args", {}), sort_keys=True)
+                past_tool_calls.add((tc.get("name"), args_str))
+
+    prefs = state.get("user_preferences") or {}
+    pref_block = (
+        "User preferences: " + ", ".join(f"{k}={v}" for k, v in prefs.items())
+        if prefs else ""
+    )
+
+    history_block = ""
+    if state.get("past_steps"):
+        history_block = "Already completed / tool results so far:\n" + "\n".join(
+            f"  - {s}" for s in state["past_steps"]
+        )
+
+    reflection_block = ""
+    if state.get("reflection_memory"):
+        reflection_block = (
+            "Reflection memory from previous failed attempts in this same task:\n"
+            + "\n".join(f"- {m}" for m in state["reflection_memory"] if m)
+        )
+
+    input_text = (
+        f"{EXECUTOR_SYSTEM}\n\n"
+        f"--- {agent_label} SPECIALIST CONTEXT ---\n"
+        f"{agent_system}\n"
+        f"--- END SPECIALIST CONTEXT ---\n\n"
+        f"Original goal: {state['input']}\n\n"
+        f"{history_block}\n\n"
+        f"{'[Preferences] ' + pref_block if pref_block else ''}\n\n"
+        f"{reflection_block}\n\n"
+        f"Current step: {current_step}\n"
+    )
+
+    print(f"\n[{agent_label}] Running step: {current_step}")
+
+    try:
+        response = model.invoke([HumanMessage(content=input_text)])
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            for tc in response.tool_calls:
+                print(f"    → calling {_format_call(tc)}")
+    except Exception as e:
+        err_text = _is_api_error(e) or f"[ERROR] {agent_label} failed: {e}"
+        print(f"\n[{agent_label}] {err_text}")
+        return {
+            "messages": [AIMessage(content=err_text)],
+            "plan": [],
+            "response": err_text,
+        }
+
+    return {
+        "messages": [HumanMessage(content=f"[Step] {current_step}"), response],
+        "executor_steps": state.get("executor_steps", 0) + 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Specialist sub-agent system prompt addenda
+# ---------------------------------------------------------------------------
+
+TRANSPORT_AGENT_SYSTEM = """You are the TRANSPORT specialist.
+Your focus: flights, hotels, car rentals, visas, city transport, and trip cost calculation.
+Only use tools from your specialist set. If the step requires a tool outside your set,
+complete what you can and note what is missing so the supervisor can re-route.
+"""
+
+WELLBEING_AGENT_SYSTEM = """You are the WELLBEING specialist.
+Your focus: activities, restaurants, beaches, seasonal tips, and destination discovery.
+Only use tools from your specialist set. If the step requires a tool outside your set,
+complete what you can and note what is missing so the supervisor can re-route.
+"""
+
+TECH_AGENT_SYSTEM = """You are the TECH specialist.
+Your focus: currency exchange, time zone conversions, web search, and saving preferences.
+Only use tools from your specialist set. If the step requires a tool outside your set,
+complete what you can and note what is missing so the supervisor can re-route.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Specialist sub-agent nodes
+# ---------------------------------------------------------------------------
+
+def transport_executor_node(state: PlanExecuteState) -> dict:
+    """TransportExecutor — handles logistics, flights, hotels, car rentals, visas."""
+    return _run_executor(state, transport_model, TRANSPORT_AGENT_SYSTEM, "TransportExecutor")
+
+
+def wellbeing_executor_node(state: PlanExecuteState) -> dict:
+    """WellbeingExecutor — handles activities, restaurants, beaches, experiences."""
+    return _run_executor(state, wellbeing_model, WELLBEING_AGENT_SYSTEM, "WellbeingExecutor")
+
+
+def tech_executor_node(state: PlanExecuteState) -> dict:
+    """TechExecutor — handles currency, time zones, web search, and preferences."""
+    return _run_executor(state, tech_model, TECH_AGENT_SYSTEM, "TechExecutor")
+
+
+# ---------------------------------------------------------------------------
+# Node: executor  (original — kept as fallback for unroutable steps)
 # ---------------------------------------------------------------------------
 
 EXECUTOR_SYSTEM = """You are a travel data retrieval agent.
@@ -1311,7 +1555,13 @@ def formatter_node(state: PlanExecuteState):
 builder = StateGraph(PlanExecuteState)
 
 builder.add_node("planner",           plan_node)
-builder.add_node("execute",           execute_node)
+# --- Multi-Agent Execution Layer ---
+builder.add_node("execute",           supervisor_router_node)       # NEW: Supervisor-Router
+builder.add_node("transport_executor", transport_executor_node)     # NEW: Transport sub-agent
+builder.add_node("wellbeing_executor", wellbeing_executor_node)     # NEW: Wellbeing sub-agent
+builder.add_node("tech_executor",      tech_executor_node)          # NEW: Tech sub-agent
+builder.add_node("execute_fallback",   execute_node)                # original executor (fallback)
+# ToolNode covers tools for ALL sub-agents (union of all specialist tool sets = original tools list)
 builder.add_node("web_gate",          web_gate_node)
 builder.add_node("tools",             ToolNode(tools))
 builder.add_node("after_tools_node",  after_tools)
@@ -1321,6 +1571,14 @@ builder.add_node("critic",            critic_node)
 builder.add_node("formatter",         formatter_node)
 builder.add_node("sif_plan_gate",         sif_plan_gate_node)
 builder.add_node("sif_alternatives_gate", sif_alternatives_gate_node)
+
+# Each specialist sub-agent feeds into the same check_executor_tools gate
+# (unchanged routing: if tool calls → web_gate, else → replan)
+for _specialist in ("transport_executor", "wellbeing_executor", "tech_executor", "execute_fallback"):
+    builder.add_conditional_edges(
+        _specialist, check_executor_tools,
+        {"web_gate": "web_gate", "replan": "replan"},
+    )
 
 
 builder.add_edge(START,     "planner")
@@ -1335,10 +1593,9 @@ builder.add_conditional_edges(
     {"execute": "execute", END: END},
 )
 
-builder.add_conditional_edges(
-    "execute", check_executor_tools,
-    {"web_gate": "web_gate", "replan": "replan"},
-)
+# NOTE: "execute" is now supervisor_router_node, which uses Command(goto=...) to route
+# directly to the correct specialist. No conditional edge needed here — the Command
+# overrides any static wiring. The specialists then feed into check_executor_tools above.
 
 # Human-in-the-loop gate: may interrupt for host approval before any web search.
 builder.add_conditional_edges(
@@ -1386,14 +1643,18 @@ graph  = builder.compile(checkpointer=memory)
 # ---------------------------------------------------------------------------
 
 PROGRESS_MAP = {
-    "planner":           "📋  Building travel plan...",
-    "execute":           "⚙️   Executing step...",
-    "tools":             "🧳  Querying travel database...",
-    "after_tools_node":  "📊  Processing tool results...",
-    "no_match_injector": "💡  Destination not found — searching for alternatives...",
-    "replan":            "🔄  Reviewing progress and re-evaluating plan...",
-    "critic":            "🧪  Critic is checking the draft answer and reflection memory...",
-    # "formatter":         "✨  Formatting final report...",
+    "planner":              "📋  Building travel plan...",
+    "execute":              "🎯  Supervisor routing step to specialist...",
+    "transport_executor":   "✈️   Transport agent executing step...",
+    "wellbeing_executor":   "🌴  Wellbeing agent executing step...",
+    "tech_executor":        "🔧  Tech agent executing step...",
+    "execute_fallback":     "⚙️   Executing step (fallback)...",
+    "tools":                "🧳  Querying travel database...",
+    "after_tools_node":     "📊  Processing tool results...",
+    "no_match_injector":    "💡  Destination not found — searching for alternatives...",
+    "replan":               "🔄  Reviewing progress and re-evaluating plan...",
+    "critic":               "🧪  Critic is checking the draft answer and reflection memory...",
+    # "formatter":          "✨  Formatting final report...",
 }
 
 
@@ -2544,7 +2805,7 @@ def select_relevant_items_for_gui(data: dict, user_request: str = "", final_text
 
 def run_agent():
     print(BANNER)
-    print("Plan-and-Execute travel agent — session 6.\n")
+    print("Plan-and-Execute travel agent — session 7 (Multi-Agent).\n")
 
     thread_id = input("Enter Session ID (e.g., student_01): ").strip() or "default"
     config = {
