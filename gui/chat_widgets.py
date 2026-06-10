@@ -73,6 +73,10 @@ class ChatMessageWidget(QFrame):
 
         if is_agent and self.has_structured_data():
             self.render_structured_trip()
+
+            if self.raw_text.strip():
+                self.add_section_title("📝", "Agent Summary")
+                self.add_plain_text(self.raw_text)
         else:
             self.add_plain_text(self.raw_text)
 
