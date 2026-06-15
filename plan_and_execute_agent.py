@@ -81,7 +81,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 MAX_EXECUTOR_STEPS = 4   # tool calls the executor may make per step
-MAX_REPLAN_CYCLES  = 6   # how many times the replanner may issue a new plan
+MAX_REPLAN_CYCLES  = 4   # how many times the replanner may issue a new plan
 MAX_CRITIC_CYCLES  = 2   # how many times the critic may send the agent back for fixes
 
 BANNER = r"""
