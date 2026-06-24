@@ -363,28 +363,102 @@ def apply_app_styles() -> None:
 
     div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) {
         width: min(900px, calc(82% - 54px)) !important;
-        margin: -2px 0 16px 54px !important;
-        border: 1px solid var(--glass-border) !important;
-        border-radius: 8px 24px 24px 24px !important;
+        margin: -2px 0 18px 54px !important;
+        padding: 0 !important;
+        border: 1px solid rgba(37, 99, 235, 0.22) !important;
+        border-radius: 10px 26px 26px 26px !important;
         background:
-            radial-gradient(circle at 8% 0%, rgba(96, 165, 250, 0.18), transparent 30%),
-            linear-gradient(180deg, var(--side-bg), var(--card)) !important;
-        box-shadow: 0 22px 58px rgba(15, 23, 42, 0.12) !important;
+            radial-gradient(circle at 0% 0%, rgba(96, 165, 250, 0.20), transparent 38%),
+            radial-gradient(circle at 100% 100%, rgba(37, 99, 235, 0.08), transparent 34%),
+            linear-gradient(180deg, rgba(255, 255, 255, 0.92), var(--card)) !important;
+        box-shadow:
+            0 1px 0 rgba(255, 255, 255, 0.65) inset,
+            0 24px 60px rgba(37, 99, 235, 0.14),
+            0 10px 28px rgba(15, 23, 42, 0.08) !important;
         overflow: hidden !important;
+        animation: hitlCardIn 0.34s cubic-bezier(0.22, 1, 0.36, 1);
+        backdrop-filter: blur(22px) saturate(1.15);
+    }
+
+    @keyframes hitlCardIn {
+        from {
+            opacity: 0;
+            transform: translateY(10px) scale(0.985);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+        }
     }
 
     .hitl-unified {
-        padding: 18px 22px 15px;
-        background: linear-gradient(90deg, rgba(37,99,235,0.12), transparent);
-        border-radius: 18px;
-        border-bottom: 1px solid var(--glass-border);
-        margin-bottom: 14px;
+        position: relative;
+        padding: 20px 24px 18px;
+        background:
+            linear-gradient(120deg, rgba(37, 99, 235, 0.14), rgba(37, 99, 235, 0.03) 48%, transparent),
+            linear-gradient(180deg, rgba(255, 255, 255, 0.35), transparent);
+        border-bottom: 1px solid rgba(37, 99, 235, 0.12);
+        margin-bottom: 0;
+    }
+
+    .hitl-unified-accent {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: linear-gradient(90deg, var(--blue), #60a5fa, rgba(96, 165, 250, 0.2));
     }
 
     .hitl-unified-row {
         display: flex;
         align-items: center;
-        gap: 13px;
+        gap: 14px;
+    }
+
+    .hitl-unified-copy {
+        flex: 1 1 auto;
+        min-width: 0;
+    }
+
+    .hitl-title-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+
+    .hitl-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
+        color: #b45309;
+        background: linear-gradient(180deg, rgba(251, 191, 36, 0.22), rgba(245, 158, 11, 0.14));
+        border: 1px solid rgba(245, 158, 11, 0.28);
+        box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.08);
+        white-space: nowrap;
+    }
+
+    .hitl-badge::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #f59e0b;
+        box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.55);
+        animation: hitlPulse 1.8s ease-out infinite;
+    }
+
+    @keyframes hitlPulse {
+        0% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.55); }
+        70% { box-shadow: 0 0 0 7px rgba(245, 158, 11, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
     }
 
     .hitl-unified-body {
@@ -392,12 +466,179 @@ def apply_app_styles() -> None:
     }
 
     .hitl-unified-note {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
         color: var(--text);
-        background: var(--message-bg);
-        border: 1px solid var(--glass-border);
-        border-radius: 16px;
-        padding: 13px 14px;
-        margin-bottom: 13px;
+        padding: 14px 24px 10px;
+        font-size: 14px;
+        line-height: 1.55;
+    }
+
+    .hitl-section-title {
+        margin: 2px 24px 10px;
+        font-size: 12px;
+        font-weight: 850;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--muted);
+    }
+
+    .hitl-section-title--inline {
+        margin: 0 0 10px;
+        padding: 0 2px;
+    }
+
+    .hitl-section-subtitle {
+        margin-top: 5px;
+        font-size: 13px;
+        font-weight: 500;
+        letter-spacing: 0;
+        text-transform: none;
+        color: var(--muted);
+        line-height: 1.45;
+    }
+
+    .hitl-details-wrap {
+        margin: 4px 24px 18px;
+    }
+
+    .hitl-details-wrap .hitl-section-title--inline {
+        margin-bottom: 8px;
+    }
+
+    .hitl-note-icon {
+        flex: 0 0 24px;
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 13px;
+        font-weight: 900;
+        font-style: italic;
+        color: var(--blue);
+        background: rgba(37, 99, 235, 0.10);
+        border: 1px solid rgba(37, 99, 235, 0.18);
+        margin-top: 1px;
+    }
+
+    .hitl-note-copy {
+        flex: 1 1 auto;
+        color: var(--muted);
+    }
+
+    .hitl-details {
+        color: var(--text);
+        background:
+            linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(248, 250, 252, 0.62));
+        border: 1px solid rgba(37, 99, 235, 0.12);
+        border-radius: 18px;
+        padding: 4px 6px;
+        margin: 0;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
+    }
+
+    .hitl-details-row {
+        display: grid;
+        grid-template-columns: 32px minmax(92px, 118px) 1fr;
+        align-items: center;
+        gap: 10px 12px;
+        padding: 11px 12px;
+        font-size: 14px;
+        line-height: 1.45;
+    }
+
+    .hitl-details-row:not(:last-child) {
+        border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+    }
+
+    .hitl-details-icon {
+        flex: 0 0 32px;
+        width: 32px;
+        height: 32px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 10px;
+        background: rgba(37, 99, 235, 0.08);
+        font-size: 14px;
+    }
+
+    .hitl-details-main {
+        display: contents;
+    }
+
+    .hitl-details-label {
+        font-size: 11px;
+        font-weight: 850;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: var(--muted);
+        align-self: center;
+    }
+
+    .hitl-details-value {
+        color: var(--text);
+        word-break: break-word;
+        font-size: 15px;
+        font-weight: 650;
+        align-self: center;
+    }
+
+    .hitl-query {
+        display: block;
+        padding: 8px 11px;
+        border-radius: 12px;
+        background: rgba(37, 99, 235, 0.06);
+        border: 1px solid rgba(37, 99, 235, 0.10);
+        font-weight: 600;
+    }
+
+    .hitl-query::before {
+        content: "“";
+        color: var(--blue);
+        margin-right: 2px;
+    }
+
+    .hitl-query::after {
+        content: "”";
+        color: var(--blue);
+        margin-left: 2px;
+    }
+
+    .hitl-chip {
+        display: inline-flex;
+        align-items: center;
+        width: fit-content;
+        padding: 5px 11px;
+        border-radius: 999px;
+        font-size: 13px;
+        font-weight: 750;
+        color: #1d4ed8;
+        background: linear-gradient(180deg, rgba(219, 234, 254, 0.95), rgba(191, 219, 254, 0.72));
+        border: 1px solid rgba(37, 99, 235, 0.18);
+    }
+
+    .hitl-host-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+    }
+
+    .hitl-host-chip {
+        display: inline-flex;
+        align-items: center;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+        color: var(--text);
+        background: rgba(15, 23, 42, 0.04);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 999px;
+        padding: 5px 10px;
+        word-break: break-all;
     }
 
     .hitl-unified-label {
@@ -414,11 +655,212 @@ def apply_app_styles() -> None:
         border: 1px solid var(--glass-border) !important;
         border-radius: 13px !important;
         padding: 7px 10px !important;
-        margin: 6px 0 !important;
+        margin: 6px 24px !important;
     }
 
     div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stCheckbox"] label {
         align-items: flex-start !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-icon {
+        width: 48px !important;
+        height: 48px !important;
+        border-radius: 16px !important;
+        font-size: 22px !important;
+        background: linear-gradient(145deg, #3b82f6, #1d4ed8) !important;
+        box-shadow:
+            0 14px 28px rgba(37, 99, 235, 0.28),
+            0 0 0 6px rgba(37, 99, 235, 0.08) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-title {
+        font-size: 20px !important;
+        font-weight: 900 !important;
+        letter-spacing: -0.02em;
+        color: var(--text) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-subtitle {
+        margin-top: 5px !important;
+        font-size: 13px !important;
+        line-height: 1.45 !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-options-title,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-divider,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-unified-label,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-section-title,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextInput"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextArea"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stSelectbox"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stExpander"] {
+        margin-left: 24px !important;
+        margin-right: 24px !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextInput"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextArea"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stSelectbox"] {
+        background:
+            linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(248, 250, 252, 0.68)) !important;
+        border: 1px solid rgba(37, 99, 235, 0.12) !important;
+        border-radius: 16px !important;
+        padding: 10px 12px 12px !important;
+        margin-bottom: 16px !important;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65), 0 8px 20px rgba(15, 23, 42, 0.04) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker {
+        display: block;
+        height: 0;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        overflow: hidden;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] {
+        margin: 0 24px 20px !important;
+        padding: 14px 0 0 !important;
+        border-top: 1px solid rgba(148, 163, 184, 0.16) !important;
+        gap: 10px !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] .stButton button {
+        min-height: 44px !important;
+        border-radius: 14px !important;
+        font-weight: 850 !important;
+        font-size: 13px !important;
+        transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] .stButton button:hover:not(:disabled) {
+        transform: translateY(-1px);
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] .stButton button[kind="primary"] {
+        background: linear-gradient(135deg, #3b82f6, #1d4ed8) !important;
+        color: #ffffff !important;
+        border: none !important;
+        box-shadow: 0 12px 28px rgba(37, 99, 235, 0.28) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] .stButton button[kind="secondary"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] .stButton button:not([kind="primary"]) {
+        background: rgba(255, 255, 255, 0.72) !important;
+        color: var(--text) !important;
+        border: 1px solid rgba(148, 163, 184, 0.28) !important;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.04) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-options-title + div[data-testid="stHorizontalBlock"] .stButton button {
+        min-height: 40px !important;
+        border-radius: 13px !important;
+        font-weight: 750 !important;
+        background: rgba(255, 255, 255, 0.82) !important;
+        border: 1px solid rgba(37, 99, 235, 0.14) !important;
+        color: var(--text) !important;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.04) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-options-title + div[data-testid="stHorizontalBlock"] .stButton button:hover:not(:disabled) {
+        border-color: rgba(37, 99, 235, 0.28) !important;
+        background: rgba(239, 246, 255, 0.95) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stHorizontalBlock"] {
+        margin-left: 24px !important;
+        margin-right: 24px !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions {
+        padding: 12px 0 20px;
+        border-top: 1px solid rgba(148, 163, 184, 0.16);
+        margin-top: 6px !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions .stButton button {
+        min-height: 44px !important;
+        border-radius: 14px !important;
+        font-weight: 850 !important;
+        font-size: 13px !important;
+        transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions .stButton button:hover:not(:disabled) {
+        transform: translateY(-1px);
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions .stButton button[kind="primary"] {
+        background: linear-gradient(135deg, #3b82f6, #1d4ed8) !important;
+        color: #ffffff !important;
+        border: none !important;
+        box-shadow: 0 12px 28px rgba(37, 99, 235, 0.28) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions .stButton button[kind="secondary"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions .stButton button:not([kind="primary"]) {
+        background: rgba(255, 255, 255, 0.72) !important;
+        color: var(--text) !important;
+        border: 1px solid rgba(148, 163, 184, 0.28) !important;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.04) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextInput"] input,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextArea"] textarea,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stSelectbox"] div[data-baseweb="select"] {
+        border-radius: 12px !important;
+        border-color: rgba(148, 163, 184, 0.24) !important;
+        background: rgba(255, 255, 255, 0.92) !important;
+        min-height: 42px !important;
+        box-shadow: none !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextInput"] input:focus,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextArea"] textarea:focus,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stSelectbox"] div[data-baseweb="select"]:focus-within {
+        border-color: rgba(37, 99, 235, 0.45) !important;
+        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextArea"] textarea {
+        min-height: 120px !important;
+        line-height: 1.5 !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextInput"] label,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextArea"] label,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stSelectbox"] label {
+        font-size: 12px !important;
+        font-weight: 800 !important;
+        letter-spacing: 0.04em !important;
+        text-transform: uppercase !important;
+        color: var(--muted) !important;
+    }
+
+    @media (max-width: 720px) {
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) {
+            width: calc(100% - 12px) !important;
+            margin-left: 6px !important;
+            border-radius: 18px !important;
+        }
+
+        .hitl-details-row {
+            grid-template-columns: 30px 1fr;
+            align-items: start;
+        }
+
+        .hitl-details-icon {
+            grid-row: 1 / span 2;
+        }
+
+        .hitl-title-row {
+            align-items: flex-start;
+        }
+
+        .hitl-badge {
+            margin-top: 2px;
+        }
     }
 
     .typing::after {
@@ -740,8 +1182,8 @@ def apply_app_styles() -> None:
         width: 9px;
         height: 9px;
         border-radius: 50%;
-        background: #22c55e;
-        box-shadow: 0 0 0 5px rgba(34,197,94,0.12);
+        background: #3b82f6;
+        box-shadow: 0 0 0 5px rgba(59, 130, 246, 0.12);
     }
 
     </style>
@@ -755,7 +1197,7 @@ def apply_app_styles() -> None:
             "app_bg": "linear-gradient(135deg, #eef6ff 0%, #f8fbff 45%, #ffffff 100%)",
             "card": "rgba(255, 255, 255, 0.74)",
             "message_bg": "rgba(255, 255, 255, 0.78)",
-            "hitl_bg": "rgba(255, 247, 237, 0.90)",
+            "hitl_bg": "rgba(239, 246, 255, 0.90)",
             "text": "#0f172a",
             "muted": "#64748b",
             "border": "#dbeafe",
@@ -772,7 +1214,7 @@ def apply_app_styles() -> None:
             "app_bg": "linear-gradient(135deg, #06132d 0%, #0f1f3d 58%, #111827 100%)",
             "card": "rgba(15, 23, 42, 0.78)",
             "message_bg": "rgba(17, 24, 39, 0.82)",
-            "hitl_bg": "rgba(42, 29, 20, 0.92)",
+            "hitl_bg": "rgba(15, 30, 58, 0.92)",
             "text": "#e5eefc",
             "muted": "#94a3b8",
             "border": "#26456f",
@@ -1462,27 +1904,27 @@ def apply_app_styles() -> None:
         """
     <style>
     /* A final, intentional design layer. This keeps the app chat-first while
-       adding warmer travel-app contrast and better responsive behavior. */
+       adding cool blue travel-app contrast and better responsive behavior. */
     :root {
-        --accent-teal: #0891b2;
-        --accent-coral: #0ea5e9;
-        --accent-green: #16a34a;
+        --accent-sky: #3b82f6;
+        --accent-coral: #60a5fa;
+        --accent-status: #2563eb;
         --shadow-soft: 0 18px 48px rgba(15, 23, 42, 0.10);
         --shadow-hover: 0 24px 58px rgba(15, 23, 42, 0.14);
     }
 
     .stApp {
         background:
-            linear-gradient(135deg, rgba(224, 242, 254, 0.88) 0%, rgba(248, 250, 252, 0.94) 38%, rgba(255, 247, 237, 0.84) 100%),
+            linear-gradient(135deg, rgba(224, 242, 254, 0.88) 0%, rgba(248, 250, 252, 0.94) 38%, rgba(239, 246, 255, 0.84) 100%),
             var(--app-bg) !important;
         font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
     [data-testid="stAppViewContainer"] > .main {
         background:
-            radial-gradient(circle at 8% 8%, rgba(8, 145, 178, 0.14), transparent 30%),
-            radial-gradient(circle at 92% 10%, rgba(249, 115, 22, 0.13), transparent 28%),
-            radial-gradient(circle at 82% 88%, rgba(22, 163, 74, 0.08), transparent 28%);
+            radial-gradient(circle at 8% 8%, rgba(37, 99, 235, 0.14), transparent 30%),
+            radial-gradient(circle at 92% 10%, rgba(96, 165, 250, 0.13), transparent 28%),
+            radial-gradient(circle at 82% 88%, rgba(29, 78, 216, 0.08), transparent 28%);
     }
 
     div[data-testid="stVerticalBlockBorderWrapper"] {
@@ -1496,7 +1938,7 @@ def apply_app_styles() -> None:
 
     .app-shell-header {
         background:
-            linear-gradient(90deg, rgba(7,26,61,0.98), rgba(14,116,144,0.94) 48%, rgba(37,99,235,0.90) 100%) !important;
+            linear-gradient(90deg, rgba(7,26,61,0.98), rgba(29,78,216,0.94) 48%, rgba(37,99,235,0.90) 100%) !important;
         border-color: rgba(186, 230, 253, 0.38) !important;
     }
 
@@ -1554,7 +1996,7 @@ def apply_app_styles() -> None:
     }
 
     .chat-status-dot {
-        background: var(--accent-green) !important;
+        background: var(--accent-status) !important;
     }
 
     .avatar {
@@ -1570,14 +2012,14 @@ def apply_app_styles() -> None:
     }
 
     .chat-user {
-        background: linear-gradient(135deg, var(--accent-teal), var(--blue)) !important;
+        background: linear-gradient(135deg, var(--blue2), var(--blue)) !important;
     }
 
     .empty-state {
         text-align: left !important;
         padding: 30px !important;
         background:
-            linear-gradient(135deg, rgba(255,255,255,0.88), rgba(240,249,255,0.76) 58%, rgba(255,247,237,0.78)),
+            linear-gradient(135deg, rgba(255,255,255,0.88), rgba(240,249,255,0.76) 58%, rgba(219,234,254,0.78)),
             var(--message-bg) !important;
     }
 
@@ -1637,7 +2079,7 @@ def apply_app_styles() -> None:
     }
 
     .inline-chat-input-shell div[data-testid="stFormSubmitButton"] button {
-        background: linear-gradient(135deg, var(--accent-teal), var(--blue)) !important;
+        background: linear-gradient(135deg, var(--blue2), var(--blue)) !important;
     }
 
     .card-section-title {
@@ -1668,7 +2110,7 @@ def apply_app_styles() -> None:
         .header-pill::after {
             content: "●";
             font-size: 15px;
-            color: var(--accent-green);
+            color: var(--accent-status);
         }
 
         .chat-user,
@@ -1725,6 +2167,126 @@ def apply_app_styles() -> None:
             var(--card) !important;
         border-color: rgba(56, 189, 248, 0.24) !important;
         color: var(--text) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) {
+        background:
+            radial-gradient(circle at 0% 0%, rgba(59, 130, 246, 0.18), transparent 38%),
+            radial-gradient(circle at 100% 100%, rgba(37, 99, 235, 0.10), transparent 34%),
+            linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(17, 24, 39, 0.92)) !important;
+        border-color: rgba(96, 165, 250, 0.28) !important;
+        box-shadow:
+            0 1px 0 rgba(255, 255, 255, 0.04) inset,
+            0 24px 60px rgba(2, 6, 23, 0.42),
+            0 10px 28px rgba(15, 23, 42, 0.24) !important;
+    }
+
+    .hitl-unified {
+        background:
+            linear-gradient(120deg, rgba(37, 99, 235, 0.18), rgba(37, 99, 235, 0.04) 48%, transparent),
+            linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent) !important;
+        border-bottom-color: rgba(96, 165, 250, 0.16) !important;
+    }
+
+    .hitl-badge {
+        color: #fbbf24 !important;
+        background: linear-gradient(180deg, rgba(245, 158, 11, 0.18), rgba(180, 83, 9, 0.12)) !important;
+        border-color: rgba(245, 158, 11, 0.24) !important;
+    }
+
+    .hitl-details {
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.82), rgba(17, 24, 39, 0.72)) !important;
+        border-color: rgba(96, 165, 250, 0.18) !important;
+    }
+
+    .hitl-details-row:not(:last-child) {
+        border-bottom-color: rgba(148, 163, 184, 0.14) !important;
+    }
+
+    .hitl-chip {
+        color: #bfdbfe !important;
+        background: linear-gradient(180deg, rgba(37, 99, 235, 0.22), rgba(30, 64, 175, 0.18)) !important;
+        border-color: rgba(96, 165, 250, 0.24) !important;
+    }
+
+    .hitl-host-chip {
+        color: #e2e8f0 !important;
+        background: rgba(2, 6, 23, 0.42) !important;
+        border-color: rgba(148, 163, 184, 0.22) !important;
+    }
+
+    .hitl-query {
+        background: rgba(37, 99, 235, 0.12) !important;
+        border-color: rgba(96, 165, 250, 0.18) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextInput"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextArea"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stSelectbox"] {
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.88), rgba(17, 24, 39, 0.78)) !important;
+        border-color: rgba(96, 165, 250, 0.16) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextInput"] input,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stTextArea"] textarea,
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) div[data-testid="stSelectbox"] div[data-baseweb="select"] {
+        background: rgba(2, 6, 23, 0.55) !important;
+        border-color: rgba(148, 163, 184, 0.20) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] {
+        border-top-color: rgba(148, 163, 184, 0.14) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] .stButton button[kind="secondary"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] .stButton button:not([kind="primary"]) {
+        background: rgba(15, 23, 42, 0.72) !important;
+        color: var(--text) !important;
+        border-color: rgba(148, 163, 184, 0.22) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-options-title + div[data-testid="stHorizontalBlock"] .stButton button {
+        background: rgba(15, 23, 42, 0.72) !important;
+        border-color: rgba(96, 165, 250, 0.18) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions {
+        border-top-color: rgba(148, 163, 184, 0.14) !important;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions .stButton button[kind="secondary"],
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions .stButton button:not([kind="primary"]) {
+        background: rgba(15, 23, 42, 0.72) !important;
+        color: var(--text) !important;
+        border-color: rgba(148, 163, 184, 0.22) !important;
+    }
+
+    .chat-bot.answer:has(.travel-answer) {
+        background:
+            radial-gradient(circle at 0% 0%, rgba(59, 130, 246, 0.14), transparent 34%),
+            linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(17, 24, 39, 0.88)) !important;
+        border-color: rgba(96, 165, 250, 0.20) !important;
+    }
+
+    .travel-answer > ul > li {
+        background: rgba(15, 23, 42, 0.72) !important;
+        border-color: rgba(96, 165, 250, 0.14) !important;
+    }
+
+    .travel-option-details {
+        background: rgba(2, 6, 23, 0.42) !important;
+        border-color: rgba(96, 165, 250, 0.12) !important;
+    }
+
+    .travel-cost-banner {
+        background: linear-gradient(135deg, rgba(37, 99, 235, 0.14), rgba(59, 130, 246, 0.10)) !important;
+        border-color: rgba(37, 99, 235, 0.22) !important;
+    }
+
+    .travel-alert {
+        background: rgba(245, 158, 11, 0.12) !important;
+        border-color: rgba(245, 158, 11, 0.22) !important;
+        color: #fbbf24 !important;
     }
 
     .chat-bot *,
@@ -1824,7 +2386,7 @@ def apply_app_styles() -> None:
         height: 44px !important;
         min-height: 44px !important;
         border-radius: 16px !important;
-        background: linear-gradient(135deg, var(--accent-teal), var(--blue)) !important;
+        background: linear-gradient(135deg, var(--blue2), var(--blue)) !important;
         color: #ffffff !important;
         border: none !important;
         box-shadow: 0 12px 26px rgba(37,99,235,0.22) !important;
@@ -2044,8 +2606,8 @@ def apply_app_styles() -> None:
         margin: 0.25rem 0 0.45rem;
         padding: 4px 9px;
         border-radius: 999px;
-        background: rgba(8, 145, 178, 0.10);
-        border: 1px solid rgba(8, 145, 178, 0.16);
+        background: rgba(37, 99, 235, 0.10);
+        border: 1px solid rgba(37, 99, 235, 0.16);
         color: var(--card-title);
         font-size: 13px;
         font-weight: 850;
@@ -2057,9 +2619,9 @@ def apply_app_styles() -> None:
         padding: 12px 14px;
         border-radius: 15px;
         background:
-            linear-gradient(135deg, rgba(8,145,178,0.14), rgba(37,99,235,0.08)),
+            linear-gradient(135deg, rgba(37,99,235,0.14), rgba(59,130,246,0.08)),
             var(--message-bg);
-        border: 1px solid rgba(8,145,178,0.18);
+        border: 1px solid rgba(37,99,235,0.18);
         color: var(--card-title);
         font-size: 16px;
         font-weight: 900;
@@ -2306,61 +2868,201 @@ def apply_app_styles() -> None:
     st.markdown(
         """
     <style>
-    /* Clean styled Markdown parser output */
+    /* Final agent answer: emoji-rich travel report */
+    .chat-bot.answer:has(.travel-answer) {
+        max-width: min(920px, 90%) !important;
+        padding: 14px 16px 16px !important;
+        background:
+            radial-gradient(circle at 0% 0%, rgba(37, 99, 235, 0.08), transparent 38%),
+            radial-gradient(circle at 100% 0%, rgba(96, 165, 250, 0.06), transparent 32%),
+            var(--message-bg) !important;
+        border-color: rgba(100, 116, 139, 0.22) !important;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06) !important;
+    }
+
     .travel-answer {
         font-size: 14px;
-        line-height: 1.56;
+        line-height: 1.55;
+        color: var(--text);
     }
 
     .travel-answer-title {
-        font-size: 21px !important;
-        margin: 0 0 0.85rem !important;
-        padding: 13px 15px !important;
-        border-radius: 17px !important;
-        background:
-            linear-gradient(135deg, rgba(8,145,178,0.14), rgba(37,99,235,0.08)),
-            var(--message-bg) !important;
-        border: 1px solid rgba(37,99,235,0.14) !important;
+        font-size: 22px !important;
+        margin: 0 0 1rem !important;
+        padding: 14px 16px !important;
+        border-radius: 16px !important;
+        background: linear-gradient(135deg, rgba(37, 99, 235, 0.14), rgba(96, 165, 250, 0.08)), var(--message-bg) !important;
+        border: 1px solid rgba(37, 99, 235, 0.18) !important;
         color: var(--card-title) !important;
+        font-weight: 900 !important;
     }
 
     .travel-answer-section {
         font-size: 17px !important;
-        margin: 1rem 0 0.45rem !important;
-        padding-top: 0.85rem !important;
-        border-top: 1px solid var(--border) !important;
-        color: var(--card-title) !important;
+        font-weight: 900 !important;
+        margin: 1.1rem 0 0.45rem !important;
+        padding: 0.55rem 0 0.45rem !important;
+        border-bottom: 2px solid rgba(37, 99, 235, 0.14) !important;
+        color: #1d4ed8 !important;
     }
 
     .travel-answer-subsection {
-        font-size: 15px !important;
-        margin: 0.75rem 0 0.35rem !important;
-        color: var(--card-title) !important;
-    }
-
-
-    /* Styled parser section headings: emoji labels inside answer text */
-    .travel-answer-subsection {
-        display: flex !important;
+        display: inline-flex !important;
         align-items: center !important;
-        gap: 7px !important;
-        margin: 0.9rem 0 0.45rem !important;
-        padding: 7px 10px !important;
+        gap: 8px !important;
+        margin: 0.9rem 0 0.35rem !important;
+        padding: 8px 14px !important;
         border-radius: 999px !important;
-        background: rgba(37, 99, 235, 0.08) !important;
-        border: 1px solid rgba(37, 99, 235, 0.14) !important;
-        color: var(--card-title) !important;
+        background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(96, 165, 250, 0.08)) !important;
+        border: 1px solid rgba(37, 99, 235, 0.18) !important;
+        color: #1e40af !important;
+        font-size: 14px !important;
+        font-weight: 900 !important;
         width: fit-content !important;
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04) !important;
     }
-    .travel-answer-subsection + ul {
-        margin-top: 0.25rem !important;
+
+    .travel-answer-subsection + ul,
+    .travel-section-block {
+        margin: 0.15rem 0 0.75rem 0.45rem !important;
+        padding: 0.35rem 0 0.35rem 0.85rem !important;
+        border-left: 2px solid rgba(37, 99, 235, 0.22) !important;
+    }
+
+    .travel-section-block > ul {
+        list-style: none !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    .travel-answer > ul > li {
+        list-style: none !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    .travel-detail-row,
+    .travel-kv-row {
+        display: flex !important;
+        align-items: baseline !important;
+        flex-wrap: wrap !important;
+        gap: 6px !important;
+        list-style: none !important;
+        margin: 0.14rem 0 !important;
+        padding: 0.22rem 0 !important;
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    .travel-kv-label,
+    .travel-detail-row > strong {
+        flex: 0 0 auto;
+        font-size: 13px !important;
+        font-weight: 800 !important;
+        color: #475569 !important;
+        white-space: nowrap;
+    }
+
+    .travel-kv-value {
+        flex: 0 1 auto;
+        font-size: 14px !important;
+        color: var(--text) !important;
+        word-break: break-word;
+    }
+
+    .travel-option-details > li:not(.travel-detail-row) {
+        display: flex !important;
+        align-items: baseline !important;
+        gap: 6px !important;
+        margin: 0.14rem 0 !important;
+        padding: 0.22rem 0 !important;
+        font-size: 14px !important;
+        color: var(--text) !important;
+    }
+
+    .travel-option-card {
+        list-style: none !important;
+        margin: 0.55rem 0 0.2rem !important;
+        padding: 0 !important;
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    .travel-option-card > strong {
+        display: block;
+        font-size: 15px !important;
+        font-weight: 900 !important;
+        color: var(--card-title) !important;
+        margin-bottom: 0.15rem !important;
+    }
+
+    .travel-option-details {
+        list-style: none !important;
+        margin: 0.1rem 0 0.2rem 0.35rem !important;
+        padding: 0.2rem 0 0.2rem 0.75rem !important;
+        border-left: 2px solid rgba(37, 99, 235, 0.18) !important;
+        background: transparent !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+    }
+
+    .travel-answer .answer-stars {
+        color: #f59e0b !important;
+        letter-spacing: 2px;
+        font-weight: 900;
+        font-size: 16px !important;
+        text-shadow: 0 1px 2px rgba(245, 158, 11, 0.3);
+    }
+
+    .travel-cost-banner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin: 1rem 0 0.55rem;
+        padding: 12px 14px;
+        border-radius: 15px;
+        background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(59, 130, 246, 0.08));
+        border: 1px solid rgba(37, 99, 235, 0.22);
+    }
+
+    .travel-cost-label {
+        font-size: 12px;
+        font-weight: 850;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--muted);
+    }
+
+    .travel-cost-value {
+        font-size: 20px;
+        font-weight: 900;
+        color: var(--card-title);
+        letter-spacing: -0.02em;
+    }
+
+    .travel-alert {
+        margin: 0.75rem 0 0.35rem;
+        padding: 10px 12px;
+        border-radius: 13px;
+        background: rgba(245, 158, 11, 0.10);
+        border: 1px solid rgba(245, 158, 11, 0.24);
+        color: #92400e;
+        font-size: 13px;
+        line-height: 1.45;
     }
 
     .travel-answer p {
         margin: 0.35rem 0 0.65rem !important;
+        line-height: 1.55 !important;
     }
 
-    .travel-answer ul,
+    .travel-answer ul ul,
     .travel-answer ol {
         margin: 0.3rem 0 0.85rem 1.3rem !important;
         padding-left: 0.8rem !important;
@@ -2380,6 +3082,12 @@ def apply_app_styles() -> None:
         font-weight: 850 !important;
     }
 
+    .travel-answer hr {
+        border: none !important;
+        border-top: 1px solid var(--border) !important;
+        margin: 0.85rem 0 !important;
+    }
+
     .travel-answer table {
         width: 100%;
         border-collapse: collapse;
@@ -2387,21 +3095,23 @@ def apply_app_styles() -> None:
         font-size: 13px;
         overflow: hidden;
         border-radius: 14px;
+        border: 1px solid var(--border);
     }
 
     .travel-answer th,
     .travel-answer td {
         border: 1px solid var(--border);
-        padding: 7px 9px;
+        padding: 8px 10px;
         text-align: left;
     }
 
     .travel-answer th {
-        background: rgba(37,99,235,0.08);
+        background: rgba(37, 99, 235, 0.08);
         color: var(--card-title);
+        font-weight: 850;
     }
 
-    .answer-stars {
+    .travel-answer .answer-stars {
         color: #f59e0b !important;
         letter-spacing: 1px;
         white-space: nowrap;

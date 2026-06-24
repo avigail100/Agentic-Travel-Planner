@@ -10,8 +10,11 @@ from streamlit_ui.formatting import (
     message_to_html,
 )
 from streamlit_ui.persistence import (
+    apply_trip_cards_update,
     bootstrap_user_conversations,
     init_ui_tables,
+    is_new_trip_request,
+    load_conversation_cards_from_db,
     load_conversation_messages_from_db,
     load_user_conversations_from_db,
     make_chat_title,
@@ -283,8 +286,14 @@ def run_until_pause_or_done(stream_input: Any, thread_id: str) -> None:
             {"role": "assistant", "content": final_response}
         )
         if structured_data:
-            st.session_state.cards = structured_data
-            st.session_state.conversation_cards[thread_id] = structured_data
+            updated_cards = apply_trip_cards_update(
+                st.session_state.cards,
+                structured_data,
+                st.session_state.get("last_user_message", ""),
+                force_replace=st.session_state.pop("cards_force_replace", False),
+            )
+            st.session_state.cards = updated_cards
+            st.session_state.conversation_cards[thread_id] = updated_cards
         save_current_chat_session()
         st.session_state.pending_interrupt = None
         st.session_state.pending_thread_id = None
@@ -462,29 +471,85 @@ def queue_selected_plan_resume(
     queue_hitl_resume_callback(payload, thread_id, "selected", "\n".join(selected_steps))
 
 
-def render_hitl_header(title: str, subtitle: str, icon: str = "✨") -> None:
+def render_hitl_section_title(title: str, subtitle: str = "") -> None:
+    subtitle_html = f'<div class="hitl-section-subtitle">{esc(subtitle)}</div>' if subtitle else ""
+    st.markdown(
+        f'<div class="hitl-section-title">{esc(title)}{subtitle_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_hitl_actions_start() -> None:
+    st.markdown('<div class="hitl-actions-marker" aria-hidden="true"></div>', unsafe_allow_html=True)
+
+
+def render_hitl_unified_header(title: str, subtitle: str, icon: str = "✨") -> None:
     st.markdown(
         f"""
-<div class="hitl-shell">
-  <div class="hitl-top">
+<div class="hitl-unified">
+  <div class="hitl-unified-accent"></div>
+  <div class="hitl-unified-row">
     <div class="hitl-icon">{icon}</div>
-    <div>
-      <div class="hitl-title">{esc(title)}</div>
+    <div class="hitl-unified-copy">
+      <div class="hitl-title-row">
+        <div class="hitl-title">{esc(title)}</div>
+        <span class="hitl-badge">Awaiting approval</span>
+      </div>
       <div class="hitl-subtitle">{esc(subtitle)}</div>
     </div>
   </div>
-  <div class="hitl-body">
+</div>
 """,
         unsafe_allow_html=True,
     )
 
 
-def render_hitl_footer() -> None:
-    st.markdown("</div></div>", unsafe_allow_html=True)
+def render_hitl_note(text: str) -> None:
+    st.markdown(
+        f'<div class="hitl-unified-note"><span class="hitl-note-icon" aria-hidden="true">i</span>'
+        f'<span class="hitl-note-copy">{markdown_to_html(text)}</span></div>',
+        unsafe_allow_html=True,
+    )
 
 
-def render_hitl_question(text: str) -> None:
-    st.markdown(f'<div class="hitl-question">{markdown_to_html(text)}</div>', unsafe_allow_html=True)
+_DETAIL_ICONS = {
+    "Query": "🔍",
+    "Category": "🏷️",
+    "Unknown hosts": "🌐",
+}
+
+
+def render_hitl_details(items: List[tuple[str, str]]) -> None:
+    rows: List[str] = []
+    for label, value in items:
+        if not value:
+            continue
+        icon = _DETAIL_ICONS.get(label, "•")
+        if label == "Category":
+            value_html = f'<span class="hitl-chip">{esc(value)}</span>'
+        elif label == "Unknown hosts":
+            hosts = [host.strip() for host in value.split(",") if host.strip()]
+            chips = "".join(f'<span class="hitl-host-chip">{esc(host)}</span>' for host in hosts)
+            value_html = f'<div class="hitl-host-list">{chips}</div>'
+        elif label == "Query":
+            value_html = f'<span class="hitl-details-value hitl-query">{esc(value)}</span>'
+        else:
+            value_html = f'<span class="hitl-details-value">{esc(value)}</span>'
+        rows.append(
+            f'<div class="hitl-details-row">'
+            f'<span class="hitl-details-icon" aria-hidden="true">{icon}</span>'
+            f'<div class="hitl-details-main">'
+            f'<span class="hitl-details-label">{esc(label)}</span>'
+            f'{value_html}'
+            f"</div></div>"
+        )
+    if rows:
+        st.markdown(
+            f'<div class="hitl-details-wrap">'
+            f'<div class="hitl-section-title hitl-section-title--inline">Request details</div>'
+            f'<div class="hitl-details">{"".join(rows)}</div></div>',
+            unsafe_allow_html=True,
+        )
 
 
 def render_hitl_panel() -> None:
@@ -507,87 +572,101 @@ def render_hitl_panel() -> None:
     if kind == "user_question":
         options = payload.get("options") or []
 
-        render_hitl_header(
-            "Bond needs your input",
-            "Choose an option or type a short answer. Cancel will resume Bond with a safe skip.",
-            "💬",
-        )
-
-        selected = ""
-        if options:
-            st.markdown('<div class="hitl-options-title">Quick choices</div>', unsafe_allow_html=True)
-            option_cols = st.columns(min(len(options), 3))
-            for idx, option in enumerate(options):
-                with option_cols[idx % min(len(options), 3)]:
-                    st.button(
-                        str(option),
-                        key=f"hitl_quick_option_{idx}",
-                        use_container_width=True,
-                        disabled=app_is_busy(),
-                        on_click=queue_hitl_resume_callback,
-                        args=(payload, thread_id, "answer", "", str(option)),
-                    )
-            st.markdown('<div class="hitl-divider"><span>or type your own answer</span></div>', unsafe_allow_html=True)
-
-        answer = st.text_input("Your answer", key="hitl_answer", placeholder="Type a short answer...")
-
-        st.markdown('<div class="hitl-actions">', unsafe_allow_html=True)
-        col_a, col_b = st.columns([1.35, 0.85])
-        with col_a:
-            st.button(
-                "Send answer",
-                use_container_width=True,
-                type="primary",
-                disabled=app_is_busy() or not answer.strip(),
-                on_click=queue_hitl_resume_from_state,
-                args=(payload, thread_id, "answer", "hitl_answer", selected),
+        with st.container(border=True):
+            render_hitl_unified_header(
+                "Bond needs your input",
+                "Choose an option or type a short answer. Cancel will resume Bond with a safe skip.",
+                "💬",
             )
-        with col_b:
-            st.button(
-                "Cancel",
-                use_container_width=True,
-                disabled=app_is_busy(),
-                on_click=queue_hitl_resume_callback,
-                args=(payload, thread_id, "cancel"),
+            render_hitl_note("Bond paused and is waiting for your answer before continuing.")
+
+            selected = ""
+            if options:
+                st.markdown('<div class="hitl-options-title">Quick choices</div>', unsafe_allow_html=True)
+                option_cols = st.columns(min(len(options), 3))
+                for idx, option in enumerate(options):
+                    with option_cols[idx % min(len(options), 3)]:
+                        st.button(
+                            str(option),
+                            key=f"hitl_quick_option_{idx}",
+                            use_container_width=True,
+                            disabled=app_is_busy(),
+                            on_click=queue_hitl_resume_callback,
+                            args=(payload, thread_id, "answer", "", str(option)),
+                        )
+                st.markdown('<div class="hitl-divider"><span>or type your own answer</span></div>', unsafe_allow_html=True)
+
+            if not options:
+                render_hitl_section_title("Your answer", "Type a short reply for Bond to continue.")
+            answer = st.text_input(
+                "Your answer",
+                key="hitl_answer",
+                placeholder="Type a short answer...",
+                label_visibility="collapsed",
             )
-        st.markdown('</div>', unsafe_allow_html=True)
-        render_hitl_footer()
+
+            render_hitl_actions_start()
+            col_a, col_b = st.columns([1.35, 0.85])
+            with col_a:
+                st.button(
+                    "Send answer",
+                    use_container_width=True,
+                    type="primary",
+                    disabled=app_is_busy() or not answer.strip(),
+                    on_click=queue_hitl_resume_from_state,
+                    args=(payload, thread_id, "answer", "hitl_answer", selected),
+                )
+            with col_b:
+                st.button(
+                    "Cancel",
+                    use_container_width=True,
+                    disabled=app_is_busy(),
+                    on_click=queue_hitl_resume_callback,
+                    args=(payload, thread_id, "cancel"),
+                )
         return
 
     if kind == "web_host_approval":
-        render_hitl_header(
-            "Approve web search",
-            "Bond wants to search external sources before continuing.",
-            "🌐",
-        )
-        render_hitl_question("Approve this search so Bond can continue planning with updated information.")
-
-        st.markdown(f'<div class="hitl-meta"><b>Query:</b> {esc(payload.get("query", ""))}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="hitl-meta"><b>Category:</b> {esc(payload.get("category", ""))}</div>', unsafe_allow_html=True)
-
         unknown_hosts = payload.get("unknown_hosts") or []
-        if unknown_hosts:
-            st.markdown(
-                f'<div class="hitl-meta"><b>Unknown hosts:</b> {esc(", ".join(unknown_hosts))}</div>',
-                unsafe_allow_html=True,
+        alternatives = payload.get("alternatives") or []
+
+        with st.container(border=True):
+            render_hitl_unified_header(
+                "Approve web search",
+                "Bond wants to search external sources before continuing.",
+                "🌐",
+            )
+            render_hitl_note("Approve this search so Bond can continue planning with updated information.")
+            render_hitl_details(
+                [
+                    ("Query", str(payload.get("query", ""))),
+                    ("Category", str(payload.get("category", ""))),
+                    ("Unknown hosts", ", ".join(unknown_hosts)),
+                ]
             )
 
-        alternatives = payload.get("alternatives") or []
-        selected_category = ""
-        if alternatives:
-            selected_category = st.selectbox("Alternative category", alternatives, key="hitl_category")
-
-        st.markdown('<div class="hitl-actions">', unsafe_allow_html=True)
-        col_a, col_b, col_c = st.columns([1.15, 1.15, 0.8])
-        with col_a:
-            st.button("Approve", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "approve"))
-        with col_b:
+            selected_category = ""
             if alternatives:
-                st.button("Use category", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "edit", "", selected_category))
-        with col_c:
-            st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
-        st.markdown('</div>', unsafe_allow_html=True)
-        render_hitl_footer()
+                render_hitl_section_title(
+                    "Override category",
+                    "Pick a different search category if the current one is not right.",
+                )
+                selected_category = st.selectbox(
+                    "Alternative category",
+                    alternatives,
+                    key="hitl_category",
+                    label_visibility="collapsed",
+                )
+
+            render_hitl_actions_start()
+            col_a, col_b, col_c = st.columns([1.15, 1.15, 0.8])
+            with col_a:
+                st.button("Approve", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "approve"))
+            with col_b:
+                if alternatives:
+                    st.button("Use category", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "edit", "", selected_category))
+            with col_c:
+                st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
         return
 
     if kind == "sif_plan_approval":
@@ -595,21 +674,12 @@ def render_hitl_panel() -> None:
         plan_key_suffix = str(abs(hash((thread_id, tuple(str(step) for step in plan)))))
 
         with st.container(border=True):
-            st.markdown(
-                """
-<div class="hitl-unified">
-  <div class="hitl-unified-row">
-    <div class="hitl-icon">🧭</div>
-    <div>
-      <div class="hitl-title">Approve the plan</div>
-      <div class="hitl-subtitle">Choose which steps Bond should execute, or edit the plan directly.</div>
-    </div>
-  </div>
-</div>
-<div class="hitl-unified-note">Bond created a plan and needs your approval before execution.</div>
-""",
-                unsafe_allow_html=True,
+            render_hitl_unified_header(
+                "Approve the plan",
+                "Choose which steps Bond should execute, or edit the plan directly.",
+                "🧭",
             )
+            render_hitl_note("Bond created a plan and needs your approval before execution.")
 
             selected_steps: List[str] = []
             if plan:
@@ -627,14 +697,16 @@ def render_hitl_panel() -> None:
             selected_plan_text = "\n".join(selected_steps)
             edit_key = f"hitl_plan_edit_{plan_key_suffix}"
 
+            render_hitl_section_title("Revise plan", "Edit steps below before approving.")
             revised_plan = st.text_area(
                 "Optional revised plan",
                 value=selected_plan_text or "\n".join(str(step) for step in plan),
                 key=edit_key,
                 help="One step per line. You can edit after selecting steps.",
+                label_visibility="collapsed",
             )
 
-            st.markdown('<div class="hitl-actions">', unsafe_allow_html=True)
+            render_hitl_actions_start()
             col_a, col_b, col_c, col_d = st.columns([1.0, 1.05, 1.0, 0.8])
             with col_a:
                 st.button("Approve all", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "approve"))
@@ -644,37 +716,37 @@ def render_hitl_panel() -> None:
                 st.button("Use edited", use_container_width=True, disabled=app_is_busy() or not revised_plan.strip(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "edit", edit_key))
             with col_d:
                 st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
-            st.markdown('</div>', unsafe_allow_html=True)
         return
 
     if kind == "sif_alternatives_offer":
-        render_hitl_header(
-            "Continue or narrow search",
-            "Bond found initial options. You can guide the next pass.",
-            "🎯",
-        )
-        render_hitl_question("Continue automatically, or add a preference to narrow the results.")
+        with st.container(border=True):
+            render_hitl_unified_header(
+                "Continue or narrow search",
+                "Bond found initial options. You can guide the next pass.",
+                "🎯",
+            )
+            render_hitl_note("Continue automatically, or add a preference to narrow the results.")
 
-        past_steps = payload.get("past_steps") or []
-        if past_steps:
-            with st.expander("What Bond checked so far", expanded=False):
-                for step in past_steps:
-                    st.markdown(f"- {esc(step)}")
+            past_steps = payload.get("past_steps") or []
+            if past_steps:
+                with st.expander("What Bond checked so far", expanded=False):
+                    for step in past_steps:
+                        st.markdown(f"- {esc(step)}")
 
-        preference = st.text_input(
-            "Optional preference",
-            placeholder="Europe only, under $800, beach resort, near public transport...",
-            key="hitl_narrow_preference",
-        )
+            render_hitl_section_title("Refine results", "Add a preference to narrow what Bond searches next.")
+            preference = st.text_input(
+                "Optional preference",
+                placeholder="Europe only, under $800, beach resort, near public transport...",
+                key="hitl_narrow_preference",
+                label_visibility="collapsed",
+            )
 
-        st.markdown('<div class="hitl-actions">', unsafe_allow_html=True)
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.button("Continue", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "continue"))
-        with col_b:
-            st.button("Narrow search", use_container_width=True, disabled=not preference.strip() or app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "narrow", "hitl_narrow_preference"))
-        st.markdown('</div>', unsafe_allow_html=True)
-        render_hitl_footer()
+            render_hitl_actions_start()
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.button("Continue", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "continue"))
+            with col_b:
+                st.button("Narrow search", use_container_width=True, disabled=not preference.strip() or app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "narrow", "hitl_narrow_preference"))
         return
 
     if kind == "sif_budget_breach":
@@ -682,46 +754,50 @@ def render_hitl_panel() -> None:
         total_cost = as_float(payload.get("total_cost"), 0.0)
         overage = as_float(payload.get("overage"), max(0.0, total_cost - budget))
 
-        render_hitl_header(
-            "Budget approval needed",
-            "The estimated cost is above the budget you gave Bond.",
-            "💰",
-        )
-        render_hitl_question(
-            f"Estimated cost is ${total_cost:,.2f}, which is ${overage:,.2f} over your ${budget:,.2f} budget."
-        )
+        with st.container(border=True):
+            render_hitl_unified_header(
+                "Budget approval needed",
+                "The estimated cost is above the budget you gave Bond.",
+                "💰",
+            )
+            render_hitl_note(
+                f"Estimated cost is ${total_cost:,.2f}, which is ${overage:,.2f} over your ${budget:,.2f} budget."
+            )
 
-        new_budget = st.text_input("New budget", placeholder="2000", key="hitl_new_budget")
+            render_hitl_section_title("Adjust budget", "Set a new limit if you want Bond to keep searching.")
+            new_budget = st.text_input(
+                "New budget",
+                placeholder="2000",
+                key="hitl_new_budget",
+                label_visibility="collapsed",
+            )
 
-        st.markdown('<div class="hitl-actions">', unsafe_allow_html=True)
-        col_a, col_b, col_c = st.columns([1.15, 1.15, 0.8])
-        with col_a:
-            st.button("Approve", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "approve"))
-        with col_b:
-            st.button("Set budget", use_container_width=True, disabled=not new_budget.strip() or app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "new_budget", "hitl_new_budget"))
-        with col_c:
-            st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
-        st.markdown('</div>', unsafe_allow_html=True)
-        render_hitl_footer()
+            render_hitl_actions_start()
+            col_a, col_b, col_c = st.columns([1.15, 1.15, 0.8])
+            with col_a:
+                st.button("Approve", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "approve"))
+            with col_b:
+                st.button("Set budget", use_container_width=True, disabled=not new_budget.strip() or app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "new_budget", "hitl_new_budget"))
+            with col_c:
+                st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
         return
 
     # Generic SIF or unknown interrupt.
-    render_hitl_header(
-        "Approval needed",
-        "Bond paused and needs your decision before continuing.",
-        "✅",
-    )
-    render_hitl_question("Review the request below and choose how to continue.")
-    st.json(payload)
+    with st.container(border=True):
+        render_hitl_unified_header(
+            "Approval needed",
+            "Bond paused and needs your decision before continuing.",
+            "✅",
+        )
+        render_hitl_note("Review the request below and choose how to continue.")
+        st.json(payload)
 
-    st.markdown('<div class="hitl-actions">', unsafe_allow_html=True)
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.button("Approve", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "approve"))
-    with col_b:
-        st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
-    st.markdown('</div>', unsafe_allow_html=True)
-    render_hitl_footer()
+        render_hitl_actions_start()
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.button("Approve", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "approve"))
+        with col_b:
+            st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
 
 init_ui_tables()
 
@@ -744,7 +820,9 @@ def save_current_chat_session() -> None:
     user_id = st.session_state.get("session_id", DEFAULT_SESSION_ID)
     conversation_id = active_thread_id()
     messages = list(st.session_state.chat_messages)
+    cards = dict(st.session_state.get("cards") or {})
     st.session_state.conversation_chats[conversation_id] = messages
+    st.session_state.conversation_cards[conversation_id] = cards
 
     user_chats = st.session_state.recent_chats_by_user.setdefault(user_id, [])
     if conversation_id in user_chats:
@@ -752,7 +830,7 @@ def save_current_chat_session() -> None:
     user_chats.insert(0, conversation_id)
     st.session_state.recent_chats_by_user[user_id] = user_chats[:12]
 
-    save_conversation_to_db(user_id, conversation_id, messages)
+    save_conversation_to_db(user_id, conversation_id, messages, cards)
 
 
 def load_conversation(conversation_id: str) -> None:
@@ -764,7 +842,11 @@ def load_conversation(conversation_id: str) -> None:
         messages = load_conversation_messages_from_db(conversation_id)
     st.session_state.chat_messages = list(messages or [])
     st.session_state.conversation_chats[conversation_id] = list(st.session_state.chat_messages)
-    st.session_state.cards = st.session_state.conversation_cards.get(conversation_id, {})
+    cards = st.session_state.conversation_cards.get(conversation_id)
+    if cards is None:
+        cards = load_conversation_cards_from_db(conversation_id)
+        st.session_state.conversation_cards[conversation_id] = cards
+    st.session_state.cards = dict(cards or {})
     st.session_state.logs = []
     st.session_state.pending_interrupt = None
     st.session_state.pending_thread_id = None
@@ -788,13 +870,14 @@ def switch_user_session(user_id: str) -> None:
     save_current_chat_session()
     st.session_state.session_id = user_id
 
-    conversation_chats, recent_ids, conversation_id = bootstrap_user_conversations(user_id)
+    conversation_chats, recent_ids, conversation_id, conversation_cards = bootstrap_user_conversations(user_id)
     st.session_state.conversation_chats.update(conversation_chats)
+    st.session_state.conversation_cards.update(conversation_cards)
     st.session_state.recent_chats_by_user[user_id] = recent_ids
 
     st.session_state.conversation_id = conversation_id
     st.session_state.chat_messages = list(st.session_state.conversation_chats.get(conversation_id, []))
-    st.session_state.cards = st.session_state.conversation_cards.get(conversation_id, {})
+    st.session_state.cards = dict(st.session_state.conversation_cards.get(conversation_id, {}))
     st.session_state.logs = []
     st.session_state.pending_interrupt = None
     st.session_state.pending_thread_id = None
@@ -822,7 +905,7 @@ def conversation_preview(conversation_id: str) -> str:
 def render_chat_message(msg: Dict[str, str]) -> None:
     is_user = msg.get("role") == "user"
     row_class = "msg-row user" if is_user else "msg-row bot"
-    bubble_class = "chat-user" if is_user else "chat-bot"
+    bubble_class = "chat-user" if is_user else "chat-bot answer"
     avatar = "🧑" if is_user else "🤖"
     content = message_to_html(msg)
     st.markdown(
@@ -867,10 +950,11 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = DEFAULT_SESSION_ID
 
 if "conversation_chats" not in st.session_state or "recent_chats_by_user" not in st.session_state:
-    boot_chats, boot_recent, boot_active = bootstrap_user_conversations(st.session_state.session_id)
+    boot_chats, boot_recent, boot_active, boot_cards = bootstrap_user_conversations(st.session_state.session_id)
     st.session_state.conversation_chats = boot_chats
     st.session_state.recent_chats_by_user = {st.session_state.session_id: boot_recent}
     st.session_state.conversation_id = boot_active
+    st.session_state.conversation_cards = boot_cards
 
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = st.session_state.recent_chats_by_user.get(
@@ -892,10 +976,14 @@ if "cards" not in st.session_state:
 if "conversation_cards" not in st.session_state:
     st.session_state.conversation_cards = {}
 
+if st.session_state.conversation_id not in st.session_state.conversation_cards:
+    st.session_state.conversation_cards[st.session_state.conversation_id] = load_conversation_cards_from_db(
+        st.session_state.conversation_id
+    )
+
 if not st.session_state.cards:
-    st.session_state.cards = st.session_state.conversation_cards.get(
-        st.session_state.conversation_id,
-        {},
+    st.session_state.cards = dict(
+        st.session_state.conversation_cards.get(st.session_state.conversation_id, {})
     )
 
 if "pending_interrupt" not in st.session_state:
@@ -913,6 +1001,9 @@ if not st.session_state.recent_chats_by_user.get(st.session_state.session_id):
 
 if "last_user_message" not in st.session_state:
     st.session_state.last_user_message = ""
+
+if "cards_force_replace" not in st.session_state:
+    st.session_state.cards_force_replace = False
 
 if "existing_message_count" not in st.session_state:
     st.session_state.existing_message_count = 0
@@ -1058,7 +1149,9 @@ if st.session_state.menu_open:
                 save_current_chat_session()
                 conversation_id = new_conversation_id(st.session_state.session_id)
                 st.session_state.conversation_chats[conversation_id] = []
-                save_conversation_to_db(st.session_state.session_id, conversation_id, [])
+                st.session_state.conversation_cards[conversation_id] = {}
+                st.session_state.cards_force_replace = False
+                save_conversation_to_db(st.session_state.session_id, conversation_id, [], {})
                 load_conversation(conversation_id)
                 st.rerun()
 
@@ -1178,6 +1271,12 @@ with main_col:
             st.session_state.chat_messages.append({"role": "user", "content": clean_message})
             st.session_state.last_user_message = clean_message
             st.session_state.logs = []
+            if is_new_trip_request(clean_message):
+                st.session_state.cards = {}
+                st.session_state.conversation_cards[thread_id] = {}
+                st.session_state.cards_force_replace = True
+            else:
+                st.session_state.cards_force_replace = False
             save_current_chat_session()
 
             if is_greeting_or_too_short(clean_message):
