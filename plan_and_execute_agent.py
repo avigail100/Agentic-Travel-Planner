@@ -62,6 +62,8 @@ from tools import (
 )
 from tools import KNOWN_HOSTS, WEB_CATEGORIES, hosts_for_category
 
+from enricher import enrich_items
+
 from sif import (
     get_sif,
     route_after_planner,
@@ -170,6 +172,7 @@ class PlanExecuteState(TypedDict):
     critic_passed: bool
     critic_count: int
     approved_hosts: List[str]   # web hosts the user approved for this session (HITL)
+    enrichments: dict           # post-selection web enrichment: {category:name -> {url, highlights}}
 
 tools = [
     fetch_flights, fetch_hotels, fetch_activities,
@@ -578,12 +581,18 @@ def _run_executor(state: PlanExecuteState, model, agent_system: str, agent_label
             + "\n".join(f"- {m}" for m in state["reflection_memory"] if m)
         )
 
+    # Include the tail of chat_history so the executor can use prices / details
+    # from previous turns without calling ask_user for already-known information.
+    chat_tail = (state.get("chat_history") or "")[-1500:]
+    prev_context_block = f"Previous conversation context:\n{chat_tail}" if chat_tail else ""
+
     input_text = (
         f"{EXECUTOR_SYSTEM}\n\n"
         f"--- {agent_label} SPECIALIST CONTEXT ---\n"
         f"{agent_system}\n"
         f"--- END SPECIALIST CONTEXT ---\n\n"
         f"Original goal: {state['input']}\n\n"
+        f"{prev_context_block}\n\n"
         f"{history_block}\n\n"
         f"{'[Preferences] ' + pref_block if pref_block else ''}\n\n"
         f"{reflection_block}\n\n"
@@ -693,6 +702,12 @@ Do not stop after lookup unless there is NO_MATCH.
 Before calling lookup_location_options, check the "Already completed" section.
 If the same location was already resolved successfully earlier in this run, do NOT call lookup_location_options again.
 Reuse the resolved location directly in the target fetch tool.
+
+Cross-turn memory rule:
+A "Previous conversation context" block may appear below showing what the agent found in earlier turns
+(prices, hotel names, flight details, etc.).  If the data needed for the current step is already visible
+in that block, use it directly — do NOT call ask_user to request information that is already known.
+ask_user is only for information that is genuinely absent from both the current turn and the history.
 """
 
 
@@ -744,9 +759,13 @@ def execute_node(state: PlanExecuteState):
             + "\n".join(f"- {m}" for m in state["reflection_memory"] if m)
         )
 
+    chat_tail = (state.get("chat_history") or "")[-1500:]
+    prev_context_block = f"Previous conversation context:\n{chat_tail}" if chat_tail else ""
+
     input_text = (
         f"{EXECUTOR_SYSTEM}\n\n"
         f"Original goal: {state['input']}\n\n"
+        f"{prev_context_block}\n\n"
         f"{history_block}\n\n"
         f"{'[Preferences] ' + pref_block if pref_block else ''}\n\n"
         f"{reflection_block}\n\n"
@@ -1520,15 +1539,8 @@ def formatter_node(state: PlanExecuteState):
 
     if total > 0:
         report += f" ESTIMATED TOTAL COST: ${total:.2f}\n"
-        if state.get("over_budget"):
-            report += " BUDGET ALERT: This plan exceeds your set limit!\n"
     if budget > 0 and total == 0:
         report += f" Budget on file: ${budget:.2f}\n"
-
-    prefs = state.get("user_preferences") or {}
-    if prefs:
-        pref_line = ", ".join(f"{k.replace('_', ' ')}={v}" for k, v in prefs.items())
-        report += f" Preferences on file: {pref_line}\n"
 
     report += "=" * 40
 
@@ -1549,13 +1561,146 @@ def formatter_node(state: PlanExecuteState):
 
 
 # ---------------------------------------------------------------------------
+# Node: enricher  (post-selection web enrichment — The Last Mile)
+# ---------------------------------------------------------------------------
+
+# System prompt for the LLM rewrite that merges Tavily enrichments inline.
+# Kept as a module-level constant so it is easy to audit and adjust.
+_INLINE_ENRICHMENT_PROMPT = """You are an editor enhancing a travel summary by integrating live web data.
+
+You will receive:
+  1. A travel summary generated from a static database.
+  2. Live web enrichments — a URL and a highlights paragraph for specific entities
+     (hotels, flights, activities, restaurants) that appear in the summary.
+
+YOUR TASK: rewrite the summary so that each entity's web data appears INLINE,
+immediately beneath that entity's data block. Follow these rules exactly.
+
+── RULE 1 · INLINE PLACEMENT ──────────────────────────────────────────────────
+After every enriched entity's existing data (price, stars, rating, etc.), insert
+a blank line followed by two lines on their own lines:
+
+  (blank line)
+  🌐 <highlights paragraph>
+  📎 [Website](<url>)
+
+Example of correct placement:
+  Hotel de Ville — 3 stars, $150/night, rating 8.3, WiFi, breakfast included
+
+  🌐 A charming 3-star hotel steps from the Seine, praised for its attentive
+     staff and hearty buffet breakfast.
+  📎 [Website](https://hoteldeville-paris.com)
+
+Rules for this block:
+  • The 🌐 line and the 📎 line MUST each start on their own line.
+  • There must be a blank line between the entity's last data line and the 🌐 line.
+  • Write the highlights text directly after the 🌐 icon — no label or prefix.
+  • Write [Website](<url>) directly after the 📎 icon — no label or prefix.
+  • Do NOT group all links at the bottom of the response.
+
+── RULE 2 · CONFLICT RESOLUTION — WEB DATA OVERRIDES DB DATA ──────────────────
+If the web highlights mention a value that differs from what the database shows
+(e.g., a different star rating, guest score, price, or amenity), the web value
+takes silent precedence: update the entity's data to reflect the live value and
+present it as-is. Do NOT add any note, warning, or explanation about the change.
+The user should see only the current, accurate information — never a correction notice.
+
+── RULE 3 · FORMATTING & TONE ─────────────────────────────────────────────────
+  • Preserve the original section headings, emojis, language, and overall structure.
+  • Use bullet points inside entity blocks for readability.
+  • Do NOT add a separate "Explore Further" or "Sources" section at the bottom.
+  • Do NOT drop any section or entity that has no enrichment — copy it unchanged.
+  • Do NOT invent information; only use what is in the enrichment data provided.
+
+── RULE 4 · SCOPE ──────────────────────────────────────────────────────────────
+If an enrichment key names an entity that does not appear in the summary, skip it.
+If an entity in the summary has no matching enrichment, leave it unchanged.
+"""
+
+
+def enricher_node(state: PlanExecuteState) -> dict:
+    """
+    Runs after the Critic approves the answer, before the Formatter renders it.
+
+    Step 1 — Tavily fetch (unchanged): collects a URL and synthesized highlights
+    for every bookable item found in the session's ToolMessages.
+
+    Step 2 — LLM inline rewrite: feeds the draft response + enrichments into
+    _base_model with _INLINE_ENRICHMENT_PROMPT.  The LLM injects each item's
+    web data directly beneath that item in the summary and applies web-over-DB
+    conflict resolution where values differ.
+
+    Fallback: if the LLM rewrite fails for any reason, the node silently falls
+    back to the old behaviour (appending a plain "Explore Further" section) so
+    the main flow is never broken.
+    """
+    # ── Step 1: fetch Tavily enrichments ──────────────────────────────────────
+    result = enrich_items(state)
+    enrichments = result.get("enrichments") or {}
+
+    if not enrichments:
+        return result   # nothing to merge — pass through unchanged
+
+    # ── Step 2: format enrichments for the LLM prompt ────────────────────────
+    enrichment_lines = []
+    for key, info in enrichments.items():
+        category, name = key.split(":", 1)
+        enrichment_lines.append(
+            f"[{category.upper()}] {name}\n"
+            f"  URL: {info.get('url', '(not found)')}\n"
+            f"  Highlights: {info.get('highlights', '(none)')}"
+        )
+    enrichment_block = "\n\n".join(enrichment_lines)
+
+    prompt = (
+        f"{_INLINE_ENRICHMENT_PROMPT}\n\n"
+        f"{'=' * 60}\n"
+        f"ORIGINAL SUMMARY (from static database)\n"
+        f"{'=' * 60}\n"
+        f"{state.get('response', '')}\n\n"
+        f"{'=' * 60}\n"
+        f"LIVE WEB ENRICHMENTS (Tavily)\n"
+        f"{'=' * 60}\n"
+        f"{enrichment_block}\n\n"
+        f"Rewrite the summary now, following all four rules above."
+    )
+
+    # ── Step 3: LLM rewrite ──────────────────────────────────────────────────
+    try:
+        rewritten = _base_model.invoke(prompt)
+        rewritten_text = (
+            rewritten.content if hasattr(rewritten, "content") else str(rewritten)
+        )
+        print(
+            f"[Enricher] Rewrote response with {len(enrichments)} "
+            f"inline enrichment(s): {list(enrichments.keys())}"
+        )
+        return {**result, "response": rewritten_text}
+
+    except Exception as exc:
+        # Graceful fallback: append a plain section rather than crashing.
+        print(f"[Enricher] LLM rewrite failed ({exc}) — falling back to section append.")
+        lines = ["\n\n---\n🔗 **Explore Further**"]
+        for key, info in enrichments.items():
+            _, name = key.split(":", 1)
+            url        = info.get("url", "")
+            highlights = info.get("highlights", "")
+            lines.append(f"\n\n**{name}**")
+            if url:
+                lines.append(f"\n  🌐 [Official website]({url})")
+            if highlights:
+                lines.append(f"\n  💬 {highlights[:200]}")
+        return {**result, "response": state.get("response", "") + "".join(lines)}
+
+
+# ---------------------------------------------------------------------------
 # Build the graph
 # ---------------------------------------------------------------------------
 
 builder = StateGraph(PlanExecuteState)
 
 builder.add_node("planner",           plan_node)
-# --- Multi-Agent Execution Layer ---
+# --- Multi-Agent Execution Layer   ---
 builder.add_node("execute",           supervisor_router_node)       # NEW: Supervisor-Router
 builder.add_node("transport_executor", transport_executor_node)     # NEW: Transport sub-agent
 builder.add_node("wellbeing_executor", wellbeing_executor_node)     # NEW: Wellbeing sub-agent
@@ -1568,6 +1713,7 @@ builder.add_node("after_tools_node",  after_tools)
 builder.add_node("no_match_injector", no_match_injector_node)
 builder.add_node("replan",            replan_node)
 builder.add_node("critic",            critic_node)
+builder.add_node("enricher",          enricher_node)
 builder.add_node("formatter",         formatter_node)
 builder.add_node("sif_plan_gate",         sif_plan_gate_node)
 builder.add_node("sif_alternatives_gate", sif_alternatives_gate_node)
@@ -1626,9 +1772,11 @@ builder.add_conditional_edges(
 )
 builder.add_conditional_edges(
     "critic", route_after_critic,
-    {"execute": "execute", "formatter": "formatter", "replan": "replan"},
+    {"execute": "execute", "formatter": "enricher", "replan": "replan"},
 )
 
+# enricher runs between critic-approval and formatter so it is always post-selection
+builder.add_edge("enricher", "formatter")
 builder.add_edge("formatter", END)
 
 # ---------------------------------------------------------------------------
@@ -1654,6 +1802,7 @@ PROGRESS_MAP = {
     "no_match_injector":    "💡  Destination not found — searching for alternatives...",
     "replan":               "🔄  Reviewing progress and re-evaluating plan...",
     "critic":               "🧪  Critic is checking the draft answer and reflection memory...",
+    "enricher":             "🔗  Finding official websites and highlights...",
     # "formatter":          "✨  Formatting final report...",
 }
 
@@ -1857,6 +2006,7 @@ def process_request(
                 "critic_count": 0,
                 "messages": [],
                 "approved_hosts": [],
+                "enrichments": {},
             })
 
             saved_prefs = {}
@@ -1886,6 +2036,7 @@ def process_request(
         "critic_count": 0,
         "messages": [],
         "approved_hosts": [],
+        "enrichments": {},
     }
 
     final_response = ""
@@ -2834,6 +2985,7 @@ def run_agent():
                 "critic_count": 0,
                 "messages": [],
                 "approved_hosts": [],
+                "enrichments": {},
             })
         else:
             prefs = existing.values.get("user_preferences") or {}
@@ -2894,6 +3046,7 @@ def run_agent():
                 "critic_count":   0,
                 "messages":       [],
                 "approved_hosts": list(saved_hosts),
+                "enrichments":    {},
             }
 
             print("\nSearching...\n")
