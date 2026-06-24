@@ -733,12 +733,13 @@ def tech_executor_node(state: PlanExecuteState) -> dict:
 # Node: executor  (original — kept as fallback for unroutable steps)
 # ---------------------------------------------------------------------------
 
+#1. Call lookup_location_options FIRST to resolve ALL location mentions based on the service_types in a SINGLE call.
 EXECUTOR_SYSTEM = """You are a travel data retrieval agent.
 Execute ONLY the current step listed below using the available tools.
 Do not skip ahead or repeat tool calls you already made.
 
 Location resolution rules (apply before calling any fetch tool):
-1. Call lookup_location_options FIRST to resolve ALL location mentions based on the service_types in a SINGLE call.
+1. Call lookup_location_options to resolve any city/country name.
 2. If it returns a list of available_locations with no exact match:
    CASE A — Semantic equivalence (country→airport, region→city):
      Examples: "Israel"→"TLV", "Japan"→"Tokyo", "Britain"→"London"
