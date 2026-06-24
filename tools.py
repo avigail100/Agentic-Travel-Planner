@@ -120,6 +120,138 @@ def lookup_location_options(search_term: str, service_type: str):
         ),
     }
 
+# Untested version
+# @tool
+# def lookup_location_options(search_terms: list[str], service_types: list[str]):
+#     """
+#     Use this tool FIRST to resolve ALL location mentions based on the service_types in a SINGLE call.
+#     You can pass one or multiple locations at once (e.g., origin and destination) to save time.
+#     When this tool returns its dictionary of results, check each term.
+#     If a term has "no_direct_match": True, decide — before doing anything else:
+#     CASE A — Semantic equivalence (country→hub, city→airport, region→main city):
+#         Examples: "Israel" → "TLV", "Rehovot" → "TLV", "Britain" → "London",
+#                   "Japan" → "Tokyo", "Ben Gurion" → "TLV"
+#         Action: Silently map to the correct item from the list and immediately call
+#                 the target tool. Do NOT inform the user. Do NOT ask for confirmation.
+
+#     CASE B — Genuine destination mismatch (the user asked for somewhere we don't serve):
+#         Examples: User asked for "Buenos Aires" and we only have European cities.
+#         Action: Return the string "NO_MATCH:<search_term>" so the graph can
+#                 route to the alternatives flow.
+#         Format exactly: NO_MATCH:<original search term>
+#     Input:
+#     - search_terms: A list of strings, e.g. ['Israel', 'France'] or ['Lod'].
+#     - service_types: A list of strings, e.g. ['flight', 'hotel']. Valid options:
+#                      'flight', 'hotel', 'activity', 'best_season', 'car_rental', 'visa_requirements', 'time_difference'
+#     Returns:
+#     A dictionary mapping each requested search term to its specific result, UNLESS an invalid service_type is provided (which returns a error string).
+#     For each search term in the returned dictionary, the value will be one of two structures:
+#     1. Direct Match (List of Dicts):
+#        If the requested location matches an entry in the database, the value is the raw results directly from the SQL query.
+#        Example: "paris": [{"available_location": "Paris"}]
+
+#     2. No Direct Match (Dictionary):
+#        If the location is NOT found directly, the value is a JSON-like dictionary containing all valid locations for that service type.
+#        This dictionary acts as a signal for you to execute CASE A or CASE B logic.
+
+#        Example:
+#        "lod": {
+#            "no_direct_match": True,
+#            "search_term": "lod",
+#            "service_types": ["flight"],
+#            "available_locations": ["Tel Aviv", "London", ...],
+#            "instruction": "<Specific instructions on how to handle CASE A vs CASE B>"
+#        }
+
+#     3. Error Message (String):
+#        If an unsupported service_type is requested, the tool bypasses the dictionary and returns a clear string indicating the error.
+#        Format: "ERROR: '<service_type>' is invalid, must be one of: [...]"
+#     """
+    
+#     # 1. Limit the number of search terms to a maximum of 4
+#     if len(search_terms) > 4:
+#         return "ERROR: A maximum of 4 search terms is allowed per call."
+
+#     # check if no duplicates and lowercase and strip the terms
+#     cleaned_terms = [term.strip().lower() for term in search_terms]
+#     if len(cleaned_terms) > 1 and len(set(cleaned_terms)) != len(cleaned_terms):
+#         return "ERROR: Duplicate locations detected in search_terms. Origin and destination cannot be the same city."
+
+#     SERVICE_MAP = {
+#         "flight":            {"table": "flights",           "cols": ["origin", "destination"]},
+#         "hotel":             {"table": "hotels",            "cols": ["city"]},
+#         "activity":          {"table": "activities",        "cols": ["city"]},
+#         "best_season":       {"table": "best_seasons",      "cols": ["city"]},
+#         "car_rental":        {"table": "car_rentals",       "cols": ["city"]},
+#         "visa_requirements": {"table": "visa_requirements", "cols": ["origin", "destination"]},
+#         "time_difference":   {"table": "time_differences",  "cols": ["origin", "destination"]},
+#     }
+
+#     # 2. Clean and deduplicate service_types to ensure uniqueness
+#     unique_services = []
+#     for s in service_types:
+#         clean_s = s.strip().lower()
+#         if clean_s not in unique_services:
+#             unique_services.append(clean_s)
+
+#     # 3. Limit the number of unique services to the size of the SERVICE_MAP
+#     if len(unique_services) > len(SERVICE_MAP):
+#         return f"ERROR: Too many service types provided. Maximum is {len(SERVICE_MAP)}."
+
+#     # 4. Check for invalid services
+#     invalid_services = [s for s in unique_services if s not in SERVICE_MAP]
+#     if invalid_services:
+#         return f"ERROR: Invalid service_types {invalid_services}, must be one of: {list(SERVICE_MAP.keys())}"
+
+#     all_locs_cache = None
+#     results = {}
+
+#     for term, raw in zip(search_terms, cleaned_terms):
+#         like_param = f"%{raw}%"
+#         query_parts = []
+#         params = []
+#         all_cols_for_cache = []
+
+#         # Iterate over our clean, unique list of services
+#         for svc in unique_services:
+#             table = SERVICE_MAP[svc]["table"]
+#             cols = SERVICE_MAP[svc]["cols"]
+#             all_cols_for_cache.extend([(table, c) for c in cols])
+
+#             for col in cols:
+#                 query_parts.append(f"SELECT DISTINCT {col} AS available_location FROM {table} WHERE LOWER({col}) LIKE ?")
+#                 params.append(like_param)
+                
+#         query = " UNION ".join(query_parts)
+#         matches = _run_query(query, tuple(params))
+
+#         if matches and not isinstance(matches, str):
+#             results[term] = matches
+#         else:
+#             # No direct match — lazy load full list for CASE A/B logic
+#             if all_locs_cache is None:
+#                 all_loc_parts = [f"SELECT DISTINCT {col} AS loc FROM {tbl}" for tbl, col in set(all_cols_for_cache)]
+#                 all_locs = _run_query(" UNION ".join(all_loc_parts))
+#                 all_locs_cache = (
+#                     [loc["loc"] for loc in all_locs if "loc" in loc]
+#                     if isinstance(all_locs, list) else []
+#                 )
+
+#             results[term] = {
+#                 "no_direct_match": True,
+#                 "search_term": term,
+#                 "service_types": unique_services,
+#                 "available_locations": all_locs_cache,
+
+#                 "instruction": (
+#                     "Decide: is this semantic equivalence (CASE A) or a genuine mismatch (CASE B)? "
+#                     "CASE A → silently pick the correct item from available_locations and call the target tool immediately. "
+#                     "CASE B → do not retry, return the exact string:'NO_MATCH:{search_term}'."
+#                 )
+#             }
+            
+#     return results
+
 @tool
 def fetch_flights(origin: str, destination: str = None):
     """

@@ -3,7 +3,7 @@
 import json
 import re
 import sqlite3
-from datetime import UTC, datetime
+from datetime import timezone, datetime
 from typing import Any, Dict, List, Tuple
 
 
@@ -61,6 +61,7 @@ def save_conversation_to_db(
     messages: List[Dict[str, str]],
     cards: Dict[str, Any] | None = None,
 ) -> None:
+    UTC = timezone.utc
     now = datetime.now(UTC).isoformat(timespec="seconds")
     title = make_chat_title(messages)
     payload = json.dumps(messages, ensure_ascii=False)

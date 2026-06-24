@@ -1,5 +1,6 @@
 import uuid
 from typing import Any, Dict, List, Tuple
+import sqlite3
 
 import streamlit as st
 from streamlit_ui.cards import render_cards, render_saved_panel
@@ -98,8 +99,41 @@ def init_graph_state_if_needed(thread_id: str) -> Tuple[dict, str, list]:
         return {}, "", []
 
 
-def build_initial_state(user_input: str, thread_id: str) -> Dict[str, Any]:
-    saved_prefs, saved_chat_history, saved_hosts = init_graph_state_if_needed(thread_id)
+def build_initial_state(user_input: str, thread_id: str, is_resume: bool = False) -> Dict[str, Any]:
+    config = default_config(thread_id)
+    try:
+        existing = graph.get_state(config)
+        sv = existing.values or {} if existing else {}
+    except Exception:
+        sv = {}
+
+    saved_prefs = sv.get("user_preferences") or {}
+    saved_chat_history = sv.get("chat_history") or ""
+    saved_hosts = sv.get("approved_hosts") or []
+    has_crashed = bool(sv.get("crashed", False))
+
+    if is_resume and has_crashed:
+        return {
+            "input":            sv.get("input", ""),
+            "plan":             sv.get("plan", []),
+            "past_steps":       sv.get("past_steps", []),
+            "response":         "",
+            "executor_steps":   sv.get("executor_steps", 0),
+            "replan_count":     sv.get("replan_count", 0),
+            "total_budget":     sv.get("total_budget", 0.0),
+            "calculated_total": sv.get("calculated_total", 0.0),
+            "over_budget":      sv.get("over_budget", False),
+            "user_preferences": saved_prefs,
+            "chat_history":     saved_chat_history,
+            "reflection_memory": sv.get("reflection_memory", []),
+            "critic_passed":    False,
+            "critic_count":     sv.get("critic_count", 0),
+            "messages":         [],        
+            "approved_hosts":   list(saved_hosts),
+            "crashed":          True,      
+            "executed_tool_calls": sv.get("executed_tool_calls", []),
+            "security_flag":    False,
+        }
 
     return {
         "input": user_input,
@@ -118,6 +152,7 @@ def build_initial_state(user_input: str, thread_id: str) -> Dict[str, Any]:
         "critic_count": 0,
         "messages": [],
         "approved_hosts": list(saved_hosts),
+        "security_flag": False,
     }
 
 
@@ -269,6 +304,43 @@ def run_until_pause_or_done(stream_input: Any, thread_id: str) -> None:
 
         if not final_response:
             final_response = "Bond finished processing, but no final response was generated."
+
+        # -----------------------------------------------------------------------------
+        # UI FIX: Clean up the step text to natural language when showing the crash queue
+        # -----------------------------------------------------------------------------
+        if values.get("crashed"):
+            remaining = values.get("plan", [])
+            done_count = len(values.get("past_steps", []))
+            
+            addon = "\n\n---\n**⚠️ Run Interrupted (API limit or error)**\n\n"
+            addon += f"**Completed steps:** {done_count}\n\n"
+            
+            if remaining:
+                addon += f"**Remaining tasks to execute:**\n"
+                
+                import re
+                def _clean_step_for_ui(step_text: str) -> str:
+                    # Remove generic tool prefixes (fetch_, search_, plan_, etc.)
+                    clean = re.sub(r'\b(?:fetch|find|calculate|search|plan|lookup|convert|save)_', '', step_text, flags=re.IGNORECASE)
+                    # Replace underscores with spaces
+                    clean = clean.replace('_', ' ')
+                    # Clean up pythonic syntax like kwargs and quotes (e.g. city="Rome" -> city Rome)
+                    clean = re.sub(r'[=")(]', ' ', clean)
+                    # Collapse multiple spaces into one
+                    clean = re.sub(r'\s+', ' ', clean).strip()
+                    # Capitalize first letter only
+                    if clean:
+                        clean = clean[0].upper() + clean[1:]
+                    return clean
+
+                for i, s in enumerate(remaining, 1):
+                    addon += f"{i}. {_clean_step_for_ui(s)}\n"
+            # else:
+                # addon += "Generating final summary...\n"
+                
+            addon += "\n*Type **'c'** or **'continue'** to resume exactly from where I stopped.*"
+            final_response = final_response.strip() + addon
+        # -----------------------------------------------------------------------------
 
         message_count = st.session_state.get("existing_message_count", 0)
         messages = (values.get("messages", []) or [])[message_count:]
@@ -824,6 +896,7 @@ def save_current_chat_session() -> None:
     st.session_state.conversation_chats[conversation_id] = messages
     st.session_state.conversation_cards[conversation_id] = cards
 
+    # Move to top ONLY when saving a new message
     user_chats = st.session_state.recent_chats_by_user.setdefault(user_id, [])
     if conversation_id in user_chats:
         user_chats.remove(conversation_id)
@@ -835,7 +908,7 @@ def save_current_chat_session() -> None:
 
 def load_conversation(conversation_id: str) -> None:
     conversation_id = (conversation_id or "").strip() or new_conversation_id(st.session_state.session_id)
-    save_current_chat_session()
+    # Notice: Removed save_current_chat_session() from here to prevent reordering on click
     st.session_state.conversation_id = conversation_id
     messages = st.session_state.conversation_chats.get(conversation_id)
     if messages is None:
@@ -857,17 +930,10 @@ def load_conversation(conversation_id: str) -> None:
     st.session_state.pending_regular_question_ready = False
     st.session_state.waiting_for_response = False
 
-    user_id = st.session_state.get("session_id", DEFAULT_SESSION_ID)
-    user_chats = st.session_state.recent_chats_by_user.setdefault(user_id, [])
-    if conversation_id in user_chats:
-        user_chats.remove(conversation_id)
-    user_chats.insert(0, conversation_id)
-    st.session_state.recent_chats_by_user[user_id] = user_chats[:12]
-
 
 def switch_user_session(user_id: str) -> None:
     user_id = (user_id or "").strip() or DEFAULT_SESSION_ID
-    save_current_chat_session()
+    # Notice: Removed save_current_chat_session() from here
     st.session_state.session_id = user_id
 
     conversation_chats, recent_ids, conversation_id, conversation_cards = bootstrap_user_conversations(user_id)
@@ -887,7 +953,6 @@ def switch_user_session(user_id: str) -> None:
     st.session_state.pending_regular_question = None
     st.session_state.pending_regular_question_ready = False
     st.session_state.waiting_for_response = False
-
 
 def conversation_preview(conversation_id: str) -> str:
     messages = (
@@ -1024,7 +1089,7 @@ if "pending_hitl_resume" not in st.session_state:
     st.session_state.pending_hitl_resume = None
 
 if "pending_hitl_resume_ready" not in st.session_state:
-    st.session_state.pending_hitl_resume_ready = False
+    st.session_state.pending_hitl_resume_ready = True
 
 if "hitl_submit_locked" not in st.session_state:
     st.session_state.hitl_submit_locked = False
@@ -1146,12 +1211,17 @@ if st.session_state.menu_open:
             )
 
             if st.button("＋ New chat", use_container_width=True, type="primary", disabled=app_is_busy()):
-                save_current_chat_session()
-                conversation_id = new_conversation_id(st.session_state.session_id)
+                user_id = st.session_state.session_id
+                conversation_id = new_conversation_id(user_id)
                 st.session_state.conversation_chats[conversation_id] = []
+                
+                # Force the new chat to the very top of the list
+                user_chats = st.session_state.recent_chats_by_user.setdefault(user_id, [])
+                user_chats.insert(0, conversation_id)
+                
                 st.session_state.conversation_cards[conversation_id] = {}
                 st.session_state.cards_force_replace = False
-                save_conversation_to_db(st.session_state.session_id, conversation_id, [], {})
+                save_conversation_to_db(user_id, conversation_id, [], {})
                 load_conversation(conversation_id)
                 st.rerun()
 
@@ -1177,17 +1247,68 @@ if st.session_state.menu_open:
                     st.session_state.conversation_chats.setdefault(row["conversation_id"], row.get("messages") or [])
 
             st.markdown("### Recent chats")
-            for conversation_id in current_user_chats[:8]:
-                label = "●" if conversation_id == active_thread_id() else "○"
-                preview = conversation_preview(conversation_id)
-                if st.button(
-                    f"{label} {preview}",
-                    key=f"conversation_{conversation_id}",
-                    use_container_width=True,
-                    disabled=conversation_id == active_thread_id() or app_is_busy(),
-                ):
-                    load_conversation(conversation_id)
-                    st.rerun()
+            # Create a container with a fixed height to enable automatic vertical scrolling
+            chat_history_container = st.container(height=400, border=False)
+            
+            with chat_history_container:
+                # Loop through all chats without the [:8] limit so the user can scroll through the entire history
+                for conversation_id in current_user_chats:
+                    col_chat, col_del = st.columns([0.84, 0.16], gap="small", vertical_alignment="center")
+                    label = "●" if conversation_id == active_thread_id() else "○"
+                    preview = conversation_preview(conversation_id)
+                    
+                    with col_chat:
+                        if st.button(
+                            f"{label} {preview}",
+                            key=f"conversation_{conversation_id}",
+                            use_container_width=True,
+                            disabled=app_is_busy(),
+                        ):
+                            if conversation_id != active_thread_id():
+                                load_conversation(conversation_id)
+                                st.rerun()
+                    
+                    with col_del:
+                        if st.button(
+                            "🗑️",
+                            key=f"delete_conv_{conversation_id}",
+                            use_container_width=True,
+                            disabled=app_is_busy(),
+                            help="Delete this chat permanently",
+                        ):
+                            with sqlite3.connect("checkpoints.db") as conn:
+                                conn.execute("DELETE FROM ui_conversations WHERE conversation_id = ?", (conversation_id,))
+                                try:
+                                    conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (conversation_id,))
+                                except sqlite3.OperationalError:
+                                    pass
+                                try:
+                                    conn.execute("DELETE FROM checkpoint_blobs WHERE thread_id = ?", (conversation_id,))
+                                except sqlite3.OperationalError:
+                                    pass
+                                try:
+                                    conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = ?", (conversation_id,))
+                                except sqlite3.OperationalError:
+                                    pass
+                            
+                            user_id = st.session_state.session_id
+                            if conversation_id in st.session_state.recent_chats_by_user.get(user_id, []):
+                                st.session_state.recent_chats_by_user[user_id].remove(conversation_id)
+                            if conversation_id in st.session_state.conversation_chats:
+                                del st.session_state.conversation_chats[conversation_id]
+                            if conversation_id in st.session_state.conversation_cards:
+                                del st.session_state.conversation_cards[conversation_id]
+                                
+                            if conversation_id == active_thread_id():
+                                remaining_chats = st.session_state.recent_chats_by_user.get(user_id, [])
+                                if remaining_chats:
+                                    load_conversation(remaining_chats[0])
+                                else:
+                                    new_id = new_conversation_id(user_id)
+                                    st.session_state.conversation_chats[new_id] = []
+                                    st.session_state.recent_chats_by_user[user_id] = [new_id]
+                                    load_conversation(new_id)
+                            st.rerun()
 
             render_saved_panel(active_thread_id())
 
@@ -1279,6 +1400,30 @@ with main_col:
                 st.session_state.cards_force_replace = False
             save_current_chat_session()
 
+            RESUME_WORDS = {"continue", "resume", "c"}
+            is_resume_attempt = clean_message.lower() in RESUME_WORDS
+            
+            has_crashed = False
+            try:
+                existing_state = graph.get_state(default_config(thread_id))
+                if existing_state and existing_state.values:
+                    has_crashed = bool(existing_state.values.get("crashed", False))
+            except Exception:
+                pass
+
+            if is_resume_attempt and has_crashed:
+                st.session_state.existing_message_count = get_existing_message_count(thread_id)
+                st.session_state.pending_regular_question = {
+                    "thread_id": thread_id,
+                    "message": clean_message,
+                    "is_resume": True,
+                    "existing_message_count": st.session_state.existing_message_count,
+                }
+                st.session_state.pending_regular_question_ready = False
+                st.session_state.waiting_for_response = True
+                save_current_chat_session()
+                st.rerun()
+
             if is_greeting_or_too_short(clean_message):
                 st.session_state.chat_messages.append(
                     {"role": "assistant", "content": greeting_response()}
@@ -1298,6 +1443,7 @@ with main_col:
             st.session_state.pending_regular_question = {
                 "thread_id": thread_id,
                 "message": clean_message,
+                "is_resume": False,
                 "existing_message_count": st.session_state.existing_message_count,
             }
             # First rerun should only show the user message + typing.
@@ -1375,7 +1521,8 @@ def process_deferred_agent_work() -> None:
             get_existing_message_count(pending["thread_id"]),
         )
 
-        initial_state = build_initial_state(pending["message"], pending["thread_id"])
+        is_resume = pending.get("is_resume", False)
+        initial_state = build_initial_state(pending["message"], pending["thread_id"], is_resume=is_resume)
         run_until_pause_or_done(initial_state, pending["thread_id"])
         st.session_state.waiting_for_response = False
         save_current_chat_session()
