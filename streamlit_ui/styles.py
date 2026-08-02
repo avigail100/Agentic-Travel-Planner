@@ -1178,12 +1178,21 @@ def apply_app_styles() -> None:
         margin: 2px 0 8px;
     }
 
-    .chat-status-dot {
-        width: 9px;
-        height: 9px;
-        border-radius: 50%;
-        background: #3b82f6;
-        box-shadow: 0 0 0 5px rgba(59, 130, 246, 0.12);
+    @media (max-height: 850px) {
+        .block-container {
+            padding-top: 0.18rem !important;
+            padding-bottom: 0.18rem !important;
+        }
+
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+            padding-top: 0.4rem !important;
+            padding-bottom: 0.4rem !important;
+        }
+
+        .chat-shell-title,
+        .right-rail-title {
+            margin-bottom: 0.15rem !important;
+        }
     }
 
     </style>
@@ -1726,11 +1735,6 @@ def apply_app_styles() -> None:
         border-bottom: 1px solid var(--border) !important;
     }
 
-    .chat-status-dot {
-        width: 10px !important;
-        height: 10px !important;
-    }
-
     /* Better message proportions. */
     .chat-user {
         max-width: 68% !important;
@@ -1995,10 +1999,6 @@ def apply_app_styles() -> None:
         letter-spacing: 0;
     }
 
-    .chat-status-dot {
-        background: var(--accent-status) !important;
-    }
-
     .avatar {
         background:
             linear-gradient(180deg, rgba(255,255,255,0.86), rgba(240,249,255,0.78)),
@@ -2091,36 +2091,6 @@ def apply_app_styles() -> None:
         border: 1px solid var(--glass-border) !important;
         border-radius: 16px !important;
         overflow: hidden;
-    }
-
-    @media (max-width: 900px) {
-        .block-container {
-            padding: 0.45rem 0.55rem 0.7rem !important;
-        }
-
-        .app-title {
-            font-size: 13px !important;
-        }
-
-        .header-pill {
-            font-size: 0 !important;
-            width: 34px;
-        }
-
-        .header-pill::after {
-            content: "●";
-            font-size: 15px;
-            color: var(--accent-status);
-        }
-
-        .chat-user,
-        .chat-bot {
-            max-width: 88% !important;
-        }
-
-        .prompt-grid {
-            grid-template-columns: 1fr;
-        }
     }
 
     /* Dark theme receives the same layout, with darker surfaces instead of pale glass. */
@@ -2546,13 +2516,6 @@ def apply_app_styles() -> None:
     div[data-testid="stForm"]:has(input[aria-label="Message"]) {
         margin-top: 6px !important;
         padding: 6px !important;
-    }
-
-    /* Let the two main work areas occupy the page instead of ending mid-screen. */
-    div[data-testid="stVerticalBlockBorderWrapper"]:has(.sidebar-brand),
-    div[data-testid="stVerticalBlockBorderWrapper"]:has(.chat-shell-title),
-    div[data-testid="stVerticalBlockBorderWrapper"]:has(.right-rail-title) {
-        min-height: calc(100vh - 74px) !important;
     }
 
     .chat-bot p,
@@ -3126,6 +3089,357 @@ def apply_app_styles() -> None:
         border: 1px solid var(--glass-border);
         color: var(--muted);
         font-size: 13px;
+    }
+    </style>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    # ---------------------------------------------------------------------
+    # Responsive layer: width breakpoints (tablet / mobile / small phone)
+    # ---------------------------------------------------------------------
+    st.markdown(
+        """
+    <style>
+    /* ---------- Tablet (<=1024px) ---------- */
+    @media (max-width: 1024px) {
+        .block-container {
+            padding: 0.3rem 0.4rem 0.5rem !important;
+        }
+
+        .chat-user, .chat-bot {
+            max-width: 92% !important;
+        }
+
+        .prompt-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+        }
+    }
+
+    /* ---------- Mobile (<=768px): stack the 3 main columns ---------- */
+    @media (max-width: 768px) {
+        html, body {
+            max-width: 100%;
+            overflow-x: hidden !important;
+        }
+
+        html, body, .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main {
+            height: auto !important;
+            overflow: visible !important;
+        }
+
+        .block-container {
+            height: auto !important;
+            overflow: visible !important;
+            padding: 0.3rem 0.35rem 0.9rem !important;
+        }
+
+        .app-title {
+            font-size: 13px !important;
+        }
+
+        .header-pill {
+            font-size: 0 !important;
+            width: 30px !important;
+            padding: 0 !important;
+        }
+        .header-pill::after {
+            content: "●";
+            font-size: 14px;
+        }
+
+        .chat-user, .chat-bot {
+            max-width: 94% !important;
+            font-size: 13.5px !important;
+        }
+
+        .avatar {
+            width: 28px !important;
+            height: 28px !important;
+            flex-basis: 28px !important;
+            font-size: 14px !important;
+        }
+
+        .prompt-grid {
+            grid-template-columns: 1fr !important;
+        }
+
+        .empty-state {
+            margin: 12px auto 0 !important;
+            padding: 18px !important;
+        }
+
+        /* Streamlit stacks the page columns at its mobile breakpoint. Keep
+           toolbar/action columns intact and let each stacked panel size to content. */
+        .st-key-chat_scroll_area,
+        .st-key-recent_chats_scroll,
+        .st-key-right_rail_scroll {
+            height: auto !important;
+            max-height: min(70vh, 620px) !important;
+            min-height: 0 !important;
+        }
+
+        .st-key-chat_scroll_area {
+            min-height: 52vh !important;
+        }
+
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) {
+            width: calc(100% - 38px) !important;
+            margin-left: 38px !important;
+        }
+
+        .hitl-unified,
+        .hitl-unified-body {
+            padding-left: 14px !important;
+            padding-right: 14px !important;
+        }
+
+        .hitl-unified-row {
+            align-items: flex-start !important;
+        }
+
+        .hitl-details-wrap,
+        .hitl-section-title,
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker + div[data-testid="stHorizontalBlock"] {
+            margin-left: 14px !important;
+            margin-right: 14px !important;
+        }
+
+        .hitl-details-row {
+            grid-template-columns: 30px minmax(0, 1fr) !important;
+        }
+
+        .hitl-details-main {
+            display: flex !important;
+            min-width: 0;
+            flex-direction: column;
+            gap: 3px;
+        }
+
+        .travel-answer {
+            max-width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .travel-answer table {
+            min-width: 520px;
+        }
+
+        .travel-card,
+        .info-card,
+        .side-item {
+            overflow-wrap: anywhere;
+        }
+    }
+
+    /* ---------- Small phones (<=420px) ---------- */
+    @media (max-width: 420px) {
+        .app-shell-header {
+            padding: 0 8px !important;
+        }
+
+        .app-title::before {
+            width: 20px !important;
+            height: 20px !important;
+            margin-right: 5px !important;
+        }
+
+        .chat-user, .chat-bot {
+            max-width: 100% !important;
+            padding: 9px 11px !important;
+        }
+
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) {
+            width: 100% !important;
+            margin-left: 0 !important;
+        }
+
+        .hitl-unified-row {
+            flex-direction: column;
+        }
+
+        .hitl-title-row {
+            align-items: flex-start;
+        }
+
+        .hitl-badge {
+            white-space: normal;
+        }
+    }
+    </style>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    # ---------------------------------------------------------------------
+    # Responsive layer: height-based scroll areas.
+    #
+    # The chat area starts with a fixed pixel height in Python. CSS ties it to
+    # the viewport, while the two side columns grow naturally with the page.
+    #
+    # A fixed pixel height does not shrink when the browser WINDOW gets
+    # shorter, so on short screens content gets cut off / overlaps. This
+    # overrides those specific containers (matched via st.container(key=...),
+    # which Streamlit exposes as a `.st-key-<key>` class) with heights tied
+    # to the viewport height (vh) instead, so they always fit.
+    #
+    # The keys below keep each sizing rule scoped to its intended panel.
+    # ---------------------------------------------------------------------
+    st.markdown(
+        """
+    <style>
+    .st-key-chat_scroll_area {
+        height: calc(100vh - 230px) !important;
+        height: calc(100dvh - 230px) !important;
+        max-height: calc(100vh - 230px) !important;
+        max-height: calc(100dvh - 230px) !important;
+        min-height: 160px !important;
+        padding-bottom: 72px !important;
+    }
+
+    /* Anchor the composer to the chat panel (not to the whole viewport).
+       This avoids Streamlit's stretched form wrapper covering the page. */
+    .st-key-chat_shell {
+        position: relative !important;
+        padding-bottom: 66px !important;
+        min-width: 0 !important;
+    }
+
+    .st-key-chat_shell div[data-testid="stForm"]:has(input[aria-label="Message"]) {
+        position: fixed !important;
+        top: auto !important;
+        left: 0.75rem !important;
+        right: calc(21.5vw + 0.75rem) !important;
+        bottom: max(0.5rem, env(safe-area-inset-bottom)) !important;
+        z-index: 1000 !important;
+        width: auto !important;
+        max-width: none !important;
+        height: auto !important;
+        max-height: 64px !important;
+        min-height: 0 !important;
+        box-sizing: border-box !important;
+        margin: 0 !important;
+        padding: 7px !important;
+        background: var(--card) !important;
+        border: 1px solid var(--glass-border) !important;
+        border-radius: 18px !important;
+        box-shadow: 0 14px 40px rgba(15, 23, 42, 0.18) !important;
+        backdrop-filter: blur(22px) saturate(1.15);
+    }
+
+    body:has(.drawer-panel) .st-key-chat_shell div[data-testid="stForm"]:has(input[aria-label="Message"]) {
+        left: calc(15.3vw + 0.75rem) !important;
+        right: calc(18.5vw + 0.75rem) !important;
+    }
+
+    .st-key-recent_chats_scroll {
+        height: calc(100vh - 430px) !important;
+        max-height: calc(100vh - 430px) !important;
+        min-height: 140px !important;
+    }
+
+    .st-key-right_rail_scroll {
+        height: calc(100vh - 170px) !important;
+        max-height: calc(100vh - 170px) !important;
+        min-height: 220px !important;
+    }
+
+    @media (max-height: 700px) {
+        .block-container { padding-top: 0.1rem !important; padding-bottom: 0.15rem !important; }
+        .app-shell-header { height: 28px !important; }
+        .chat-shell-title, .right-rail-title { margin-bottom: 0.1rem !important; padding-bottom: 0.15rem !important; }
+        .sidebar-brand { padding: 2px 2px 5px !important; margin-bottom: 4px !important; }
+        .msg-row { margin: 5px 0 8px !important; }
+        div[data-testid="stForm"]:has(input[aria-label="Message"]) { margin-top: 4px !important; padding: 5px !important; }
+    }
+
+    @media (max-height: 520px) {
+        .st-key-chat_scroll_area {
+            height: calc(100dvh - 150px) !important;
+            max-height: calc(100dvh - 150px) !important;
+            min-height: 96px !important;
+        }
+        .st-key-right_rail_scroll { height: calc(100vh - 120px) !important; max-height: calc(100vh - 120px) !important; }
+        .st-key-recent_chats_scroll { height: calc(100vh - 300px) !important; max-height: calc(100vh - 300px) !important; }
+        .empty-state { padding: 12px !important; margin-top: 6px !important; }
+        .prompt-grid { display: none !important; }
+    }
+
+    /* Width rules come last so viewport-height sizing cannot override mobile. */
+    @media (max-width: 768px) {
+        .st-key-chat_scroll_area,
+        .st-key-recent_chats_scroll,
+        .st-key-right_rail_scroll {
+            height: auto !important;
+            max-height: min(70vh, 620px) !important;
+            min-height: 0 !important;
+        }
+
+        .st-key-chat_scroll_area {
+            height: clamp(160px, calc(100dvh - 190px), 520px) !important;
+            max-height: calc(100dvh - 190px) !important;
+            min-height: 160px !important;
+            overflow-y: auto !important;
+        }
+
+        .st-key-chat_shell div[data-testid="stForm"]:has(input[aria-label="Message"]),
+        body:has(.drawer-panel) .st-key-chat_shell div[data-testid="stForm"]:has(input[aria-label="Message"]) {
+            position: fixed !important;
+            top: auto !important;
+            left: 0.4rem !important;
+            right: 0.4rem !important;
+            bottom: max(0.4rem, env(safe-area-inset-bottom)) !important;
+            width: auto !important;
+            max-width: none !important;
+            height: auto !important;
+            max-height: 64px !important;
+            min-height: 0 !important;
+            z-index: 1000 !important;
+        }
+    }
+
+    @media (max-width: 768px) and (max-height: 420px) {
+        .st-key-chat_scroll_area {
+            height: calc(100dvh - 132px) !important;
+            max-height: calc(100dvh - 132px) !important;
+            min-height: 72px !important;
+        }
+
+        .chat-shell-title {
+            display: none !important;
+        }
+    }
+
+    /* Side columns follow their content. The document itself owns vertical
+       scrolling, so items such as saved preferences cannot be clipped. */
+    html,
+    body,
+    #root,
+    .stApp,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stAppViewContainer"] > .main,
+    [data-testid="stMain"],
+    [data-testid="stMainBlockContainer"],
+    .block-container {
+        height: auto !important;
+        min-height: 100% !important;
+        max-height: none !important;
+        overflow-y: visible !important;
+    }
+
+    .st-key-recent_chats_scroll,
+    .st-key-right_rail_scroll {
+        height: auto !important;
+        min-height: 0 !important;
+        max-height: none !important;
+        overflow: visible !important;
+    }
+
+    .block-container {
+        padding-bottom: 5.5rem !important;
     }
     </style>
     """,

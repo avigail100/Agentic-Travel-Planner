@@ -1247,8 +1247,8 @@ if st.session_state.menu_open:
                     st.session_state.conversation_chats.setdefault(row["conversation_id"], row.get("messages") or [])
 
             st.markdown("### Recent chats")
-            # Create a container with a fixed height to enable automatic vertical scrolling
-            chat_history_container = st.container(height=400, border=False)
+            # Let the page grow naturally so saved preferences are never clipped.
+            chat_history_container = st.container(border=False, key="recent_chats_scroll")
             
             with chat_history_container:
                 # Loop through all chats without the [:8] limit so the user can scroll through the entire history
@@ -1313,7 +1313,7 @@ if st.session_state.menu_open:
             render_saved_panel(active_thread_id())
 
 with main_col:
-    with st.container(border=True):
+    with st.container(border=True, key="chat_shell"):
         st.markdown(
             """
 <div class="chat-shell-title">
@@ -1324,7 +1324,7 @@ with main_col:
             unsafe_allow_html=True,
         )
 
-        chat_area = st.container(height=700 if not st.session_state.menu_open else 680, border=False)
+        chat_area = st.container(height=700 if not st.session_state.menu_open else 680, border=False, key="chat_scroll_area",)
         with chat_area:
             if not st.session_state.chat_messages:
                 st.markdown(
@@ -1463,7 +1463,7 @@ with right_col:
 """,
             unsafe_allow_html=True,
         )
-        right_cards = st.container(height=760, border=False)
+        right_cards = st.container(border=False, key="right_rail_scroll")
         with right_cards:
             if st.session_state.get("cards"):
                 render_cards(st.session_state.cards, columns=1, detail_columns=1)
