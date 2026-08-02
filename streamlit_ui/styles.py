@@ -3441,6 +3441,72 @@ def apply_app_styles() -> None:
     .block-container {
         padding-bottom: 5.5rem !important;
     }
+
+    /* Desktop behaves like an app shell: the browser page stays still and
+       each content panel owns its scrolling. */
+    @media (min-width: 769px) {
+        html,
+        body,
+        #root,
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stMain"] {
+            height: 100vh !important;
+            height: 100dvh !important;
+            min-height: 0 !important;
+            overflow: hidden !important;
+        }
+
+        [data-testid="stMainBlockContainer"],
+        .main .block-container,
+        .block-container {
+            height: 100vh !important;
+            height: 100dvh !important;
+            min-height: 0 !important;
+            overflow: hidden !important;
+            padding-bottom: 0.4rem !important;
+            box-sizing: border-box !important;
+        }
+
+        .st-key-left_sidebar_shell,
+        .st-key-chat_shell,
+        .st-key-trip_cards_shell {
+            height: calc(100vh - 58px) !important;
+            height: calc(100dvh - 58px) !important;
+            max-height: calc(100dvh - 58px) !important;
+            min-height: 0 !important;
+            box-sizing: border-box !important;
+        }
+
+        .st-key-left_sidebar_shell,
+        .st-key-trip_cards_shell {
+            overflow-x: hidden !important;
+            overflow-y: auto !important;
+            scrollbar-gutter: stable;
+        }
+
+        .st-key-chat_shell {
+            overflow: hidden !important;
+        }
+
+        .st-key-chat_scroll_area {
+            height: calc(100vh - 178px) !important;
+            height: calc(100dvh - 178px) !important;
+            max-height: calc(100dvh - 178px) !important;
+            min-height: 100px !important;
+            overflow-x: hidden !important;
+            overflow-y: auto !important;
+            padding-bottom: 76px !important;
+        }
+
+        .st-key-recent_chats_scroll,
+        .st-key-right_rail_scroll {
+            height: auto !important;
+            max-height: none !important;
+            overflow: visible !important;
+        }
+    }
     </style>
     """,
         unsafe_allow_html=True,

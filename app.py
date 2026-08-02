@@ -1197,7 +1197,7 @@ else:
 
 if st.session_state.menu_open:
     with left_col:
-        with st.container(border=True):
+        with st.container(border=True, key="left_sidebar_shell"):
             st.markdown(
                 """
 <div class="drawer-panel">
@@ -1454,7 +1454,7 @@ with main_col:
             st.rerun()
 
 with right_col:
-    with st.container(border=True):
+    with st.container(border=True, key="trip_cards_shell"):
         st.markdown(
             """
 <div class="right-rail-title">
