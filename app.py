@@ -39,7 +39,7 @@ from plan_and_execute_agent import (
 # App constants
 # ---------------------------------------------------------------------
 
-DEFAULT_SESSION_ID = "demo_session"
+DEFAULT_SESSION_ID = "session"
 
 
 # ---------------------------------------------------------------------
@@ -973,12 +973,13 @@ def render_chat_message(msg: Dict[str, str]) -> None:
     is_user = msg.get("role") == "user"
     row_class = "msg-row user" if is_user else "msg-row bot"
     bubble_class = "chat-user" if is_user else "chat-bot answer"
-    avatar = "🧑" if is_user else "🤖"
+    avatar = "🧑" if is_user else ""
+    avatar_class = "avatar" if is_user else "avatar bot-avatar"
     content = message_to_html(msg)
     st.markdown(
         f"""
 <div class="{row_class}">
-  <div class="avatar">{avatar}</div>
+  <div class="{avatar_class}">{avatar}</div>
   <div class="{bubble_class}">{content}</div>
 </div>
 """,
@@ -1002,7 +1003,7 @@ def render_typing_message(text: str = "Bond is thinking") -> None:
     st.markdown(
         f"""
 <div class="msg-row bot">
-  <div class="avatar">🤖</div>
+  <div class="avatar bot-avatar"></div>
   <div class="typing">{esc(text)}</div>
 </div>
 """,

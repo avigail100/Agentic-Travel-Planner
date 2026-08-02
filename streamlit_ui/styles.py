@@ -1,6 +1,12 @@
 """Styling for the Streamlit Bond travel planner UI."""
 
+import base64
+from pathlib import Path
+
 import streamlit as st
+
+
+BOND_AVATAR_PATH = Path(__file__).resolve().parent.parent / "bond_robot.png"
 
 
 def apply_app_styles() -> None:
@@ -1128,6 +1134,36 @@ def apply_app_styles() -> None:
     """,
         unsafe_allow_html=True,
     )
+
+    if BOND_AVATAR_PATH.is_file():
+        avatar_data = base64.b64encode(BOND_AVATAR_PATH.read_bytes()).decode("ascii")
+        st.markdown(
+            f"""
+    <style>
+    .avatar.bot-avatar {{
+        width: 40px !important;
+        height: 40px !important;
+        flex: 0 0 40px !important;
+        background-image: url("data:image/png;base64,{avatar_data}") !important;
+        background-position: center !important;
+        background-repeat: no-repeat !important;
+        background-size: 140% !important;
+        color: transparent !important;
+        image-rendering: -webkit-optimize-contrast;
+        filter: contrast(1.06) saturate(1.04);
+    }}
+
+    @media (max-width: 768px) {{
+        .avatar.bot-avatar {{
+            width: 34px !important;
+            height: 34px !important;
+            flex-basis: 34px !important;
+        }}
+    }}
+    </style>
+    """,
+            unsafe_allow_html=True,
+        )
 
 
     # ---------------------------------------------------------------------
