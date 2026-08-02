@@ -229,8 +229,8 @@ def apply_app_styles() -> None:
         word-break: break-word;
     }
     .chat-user {
-        background: linear-gradient(135deg, var(--blue), var(--blue2));
-        color: #ffffff;
+        background: var(--user-message-bg);
+        color: var(--user-message-text);
         border-radius: 20px 20px 5px 20px;
         max-width: 75%;
         box-shadow: 0 14px 30px rgba(37, 99, 235, 0.24);
@@ -245,7 +245,7 @@ def apply_app_styles() -> None:
     }
     .chat-user *,
     .chat-user {
-        color: #ffffff !important;
+        color: var(--user-message-text) !important;
     }
     .empty-state {
         text-align: center;
@@ -964,6 +964,8 @@ def apply_app_styles() -> None:
             "button_hover": "#eff6ff",
             "avatar_bg": "rgba(255, 255, 255, 0.72)",
             "card_title": "#0b2a5b",
+            "user_message_bg": "linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%)",
+            "user_message_text": "#123a70",
         },
         "Dark": {
             "app_bg": "linear-gradient(135deg, #06132d 0%, #0f1f3d 58%, #111827 100%)",
@@ -979,6 +981,8 @@ def apply_app_styles() -> None:
             "button_hover": "#1e3a5f",
             "avatar_bg": "rgba(30, 41, 59, 0.86)",
             "card_title": "#dbeafe",
+            "user_message_bg": "linear-gradient(135deg, #1d4ed8, #2563eb)",
+            "user_message_text": "#ffffff",
         },
     }[theme if theme in {"Light", "Dark"} else "Light"]
 
@@ -999,6 +1003,8 @@ def apply_app_styles() -> None:
         --button-hover: {theme_vars["button_hover"]};
         --avatar-bg: {theme_vars["avatar_bg"]};
         --card-title: {theme_vars["card_title"]};
+        --user-message-bg: {theme_vars["user_message_bg"]};
+        --user-message-text: {theme_vars["user_message_text"]};
     }}
 
     input,
@@ -1478,7 +1484,7 @@ def apply_app_styles() -> None:
             var(--message-bg) !important;
     }
     .chat-user {
-        background: linear-gradient(135deg, var(--blue2), var(--blue)) !important;
+        background: var(--user-message-bg) !important;
     }
     .empty-state {
         text-align: left !important;
@@ -2744,12 +2750,13 @@ def apply_app_styles() -> None:
             padding-bottom: 76px !important;
         }
     .st-key-recent_chats_scroll,
-    .st-key-right_rail_scroll {
+        .st-key-right_rail_scroll {
             height: auto !important;
             max-height: none !important;
             overflow: visible !important;
         }
     }
+
     </style>
     """,
         unsafe_allow_html=True,
