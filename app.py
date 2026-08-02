@@ -526,6 +526,8 @@ def queue_hitl_resume_from_state(
     selected_option: str = "",
 ) -> None:
     answer_text = str(st.session_state.get(answer_key, "")) if answer_key else ""
+    if answer_key and not answer_text.strip():
+        return
     queue_hitl_resume_callback(payload, thread_id, action, answer_text, selected_option)
 
 
@@ -684,7 +686,7 @@ def render_hitl_panel() -> None:
                     "Send answer",
                     use_container_width=True,
                     type="primary",
-                    disabled=app_is_busy() or not answer.strip(),
+                    disabled=app_is_busy(),
                     on_click=queue_hitl_resume_from_state,
                     args=(payload, thread_id, "answer", "hitl_answer", selected),
                 )
@@ -785,7 +787,7 @@ def render_hitl_panel() -> None:
             with col_b:
                 st.button("Run selected", use_container_width=True, disabled=app_is_busy() or not selected_steps, on_click=queue_selected_plan_resume, args=(payload, thread_id, [str(step) for step in plan], plan_key_suffix))
             with col_c:
-                st.button("Use edited", use_container_width=True, disabled=app_is_busy() or not revised_plan.strip(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "edit", edit_key))
+                st.button("Use edited", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "edit", edit_key))
             with col_d:
                 st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
         return
@@ -818,7 +820,7 @@ def render_hitl_panel() -> None:
             with col_a:
                 st.button("Continue", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "continue"))
             with col_b:
-                st.button("Narrow search", use_container_width=True, disabled=not preference.strip() or app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "narrow", "hitl_narrow_preference"))
+                st.button("Narrow search", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "narrow", "hitl_narrow_preference"))
         return
 
     if kind == "sif_budget_breach":
@@ -849,7 +851,7 @@ def render_hitl_panel() -> None:
             with col_a:
                 st.button("Approve", use_container_width=True, type="primary", disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "approve"))
             with col_b:
-                st.button("Set budget", use_container_width=True, disabled=not new_budget.strip() or app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "new_budget", "hitl_new_budget"))
+                st.button("Set budget", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_from_state, args=(payload, thread_id, "new_budget", "hitl_new_budget"))
             with col_c:
                 st.button("Cancel", use_container_width=True, disabled=app_is_busy(), on_click=queue_hitl_resume_callback, args=(payload, thread_id, "cancel"))
         return

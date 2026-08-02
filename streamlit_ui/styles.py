@@ -590,6 +590,12 @@ def apply_app_styles() -> None:
         margin-bottom: 16px !important;
         box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65), 0 8px 20px rgba(15, 23, 42, 0.04) !important;
     }
+
+    [data-testid="InputInstructions"],
+    [data-testid="InputInstructions"] > span {
+        display: none !important;
+        visibility: hidden !important;
+    }
     div[data-testid="stVerticalBlockBorderWrapper"]:has(.hitl-unified) .hitl-actions-marker {
         display: block;
         height: 0;
