@@ -62,8 +62,8 @@ Create a `.env` file in the project root:
 
 ```env
 GOOGLE_API_KEY=your_key
-OPENAI_API_KEY=your_key
 GROQ_API_KEY=your_key
+TAVILY_API_KEY=your_key
 ```
 
 ---
@@ -92,7 +92,6 @@ http://localhost:8501
 * LangChain
 * SQLite
 * Google Gemini
-* OpenAI
 * Groq
 
 ---
