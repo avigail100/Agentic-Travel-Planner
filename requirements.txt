@@ -1,0 +1,13 @@
+streamlit
+langgraph
+langgraph-checkpoint-sqlite
+langchain
+langchain-core
+langchain-community
+langchain-google-genai
+langchain-openai
+langchain-groq
+python-dotenv
+pydantic
+requests
+mistune
